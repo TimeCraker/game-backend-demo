@@ -44,6 +44,7 @@ func main() {
 	// 注册路由
 	r.POST("/register", handlers.Register(mysqlDB))
 	r.POST("/login", handlers.Login(mysqlDB))
+	r.GET("/ws", handlers.HandleWS())
 
 	// 需要认证的 API 组
 	api := r.Group("/api")
