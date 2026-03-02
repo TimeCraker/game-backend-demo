@@ -1,16 +1,19 @@
 package handlers
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 
+	// 这里的路径确保和你 go.mod 里的 module 名一致
+	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
 
-// Upgrader 用于将 HTTP 协议升级为 WebSocket 协议
+// Upgrader 负责把普通的 HTTP 请求“升级”成长连接
 var upgrader = websocket.Upgrader{
-	// CheckOrigin 解决跨域问题，现在我们允许所有人连接
+	// 允许跨域（生产环境可以限制域名，开发环境设为 true 方便调试）
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
@@ -18,32 +21,66 @@ var upgrader = websocket.Upgrader{
 
 func HandleWS() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 1. 升级连接
-		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
-		if err != nil {
-			log.Printf("❌ 升级 WebSocket 失败: %v", err)
+		// --- 🟢 第一步：身份大检查 (Authentication) ---
+
+		// 尝试从 URL 后面拿 token (?token=xxx)
+		tokenString := c.Query("token")
+		if tokenString == "" {
+			log.Println("❌ 拒绝连接：没带 Token，你是谁？")
 			return
 		}
-		// 确保函数结束时关闭连接
-		defer conn.Close()
-		log.Println("🔌 客户端已通过 WebSocket 连接")
 
-		// 2. 循环读写消息 (回音壁逻辑)
+		// 解析 Token，拿不到用户 ID 就直接踢出去
+		claims, err := utils.ParseToken(tokenString)
+		if err != nil {
+			log.Printf("❌ 拒绝连接：Token 伪造或过期: %v", err)
+			return
+		}
+
+		userID := claims.UserID // 成功认领玩家 ID
+
+		// --- 🟡 第二步：协议大升级 (Upgrade) ---
+
+		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+		if err != nil {
+			log.Printf("❌ 协议升级失败: %v", err)
+			return
+		}
+
+		// --- 🔵 第三步：登记与清理 (Management) ---
+
+		// 1. 进门登记：让大总管 Hub 把这个连接记在小本本上
+		GlobalHub.Register(userID, conn)
+
+		// 2. 离场清理：使用一个 defer 函数包裹所有“身后事”
+		// 这样不管是因为报错断开，还是玩家自己关掉，都会执行这里
+		defer func() {
+			GlobalHub.Unregister(userID) // 从大总管名单里抹除，防止发空信
+			conn.Close()                 // 切断物理连接
+			log.Printf("👤 玩家 %d 的连接已释放，清理完毕", userID)
+		}()
+
+		log.Printf("🔌 玩家 ID:%d 已成功进入游戏大厅连接池", userID)
+
+		// --- 🟠 第四步：消息传送阵 (Message Loop) ---
+
 		for {
-			// 读取客户端发来的消息
-			messageType, p, err := conn.ReadMessage()
+			// ReadMessage 会一直阻塞，直到客户端发消息过来
+			_, p, err := conn.ReadMessage()
 			if err != nil {
-				log.Printf("Disconnected: %v", err)
+				// 只要 Read 报错，说明连接断了（比如玩家断网了）
+				log.Printf("⚠️ 玩家 %d 连接异常，准备触发清理逻辑", userID)
 				break
 			}
 
-			log.Printf("📩 收到消息: %s", string(p))
+			log.Printf("📩 收到来自玩家 %d 的消息: %s", userID, string(p))
 
-			// 原样发回去
-			if err := conn.WriteMessage(messageType, p); err != nil {
-				log.Printf("Write error: %v", err)
-				break
-			}
+			// 【核心逻辑】：不要只回发给自己，而是让大总管“广播”给所有人！
+			// 我们把消息包装成： "玩家 1 说: 消息内容"
+			broadcastContent := fmt.Sprintf("玩家 %d 说: %s", userID, string(p))
+
+			// 呼叫大总管，全服通告
+			GlobalHub.Broadcast([]byte(broadcastContent))
 		}
 	}
 }

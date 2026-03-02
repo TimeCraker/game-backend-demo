@@ -40,7 +40,7 @@ func Login(mysqlDB *gorm.DB) gin.HandlerFunc {
 		}
 
 		// 4. 生成 JWT Token
-		token, err := utils.GenerateToken(user.ID)
+		token, err := utils.GenerateToken(int(user.ID))
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Token生成失败"})
 			return

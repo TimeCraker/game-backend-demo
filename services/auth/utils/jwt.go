@@ -9,15 +9,17 @@ import (
 var jwtSecret = []byte("your-secret-key") // 实际应改为环境变量
 
 type Claims struct {
-	UserID uint `json:"user_id"`
+	// 【修改点】将 uint 改为 int，确保全项目类型统一
+	UserID int `json:"user_id"`
 	jwt.RegisteredClaims
 }
 
 // GenerateToken 生成 JWT token，有效期24小时
-func GenerateToken(userID uint) (string, error) {
+// 【修改点】参数也改为 int
+func GenerateToken(userID int) (string, error) {
 	claims := Claims{
-		userID,
-		jwt.RegisteredClaims{
+		UserID: userID, // 显式指定字段名更清晰
+		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
