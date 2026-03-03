@@ -3,36 +3,31 @@ package main
 import (
 	"log"
 
-	// 【注意】请确保此路径与你的 go.mod 模块名一致
 	"github.com/TimeCraker/game-backend-demo/services/auth/db"
 	"github.com/TimeCraker/game-backend-demo/services/auth/handlers"
-	"github.com/TimeCraker/game-backend-demo/services/auth/models"
-
 	"github.com/gin-gonic/gin"
-	"gorm.io/driver/mysql"
-	"gorm.io/gorm"
 )
 
 func main() {
-	// 1. 连接 MySQL (此处暂时留在 main，方便你目前 handlers 的调用)
-	dsn := "root:rootpassword@tcp(localhost:3306)/game_dev?charset=utf8mb4&parseTime=True&loc=Local"
-	mysqlDB, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
-	if err != nil {
-		log.Fatalf("❌ MySQL连接失败: %v", err)
-	}
-	// 自动迁移用户表
-	mysqlDB.AutoMigrate(&models.User{})
-	log.Println("✅ MySQL 已连接并完成自动迁移")
+	// --- 1. 数据库模块初始化 ---
 
-	// 2. 连接 Redis (调用你 db/redis.go 里的 InitRedis)
-	// 这个函数里我们写了 Ping 测试，如果连不上会直接 panic 报错
+	// 初始化 MySQL (内部包含连接和 AutoMigrate)
+	db.InitMySQL()
+
+	// 初始化 Redis
 	db.InitRedis()
-	log.Println("✅ Redis 已通过 db 模块初始化成功")
 
-	// 3. 创建 Gin 引擎
+	// --- 2. 核心交接：全局变量赋值 ---
+
+	// 【重点】把 db 包里的连接交给 handlers 包的全局变量 DB
+	// 这样 websocket.go 和其他 handler 就能直接用 handlers.DB 了
+	handlers.DB = db.SQLDB
+
+	// --- 3. 启动 Gin 引擎 ---
+
 	r := gin.Default()
 
-	// 健康检查接口
+	// 健康检查接口：让运维或 Docker 知道服务状态
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"status": "up",
@@ -41,19 +36,25 @@ func main() {
 		})
 	})
 
-	// 注册路由
-	r.POST("/register", handlers.Register(mysqlDB))
-	r.POST("/login", handlers.Login(mysqlDB))
-	r.GET("/ws", handlers.HandleWS())
+	// --- 4. 路由注册 ---
 
-	// 需要认证的 API 组
+	// 注意：因为使用了全局 handlers.DB，函数后面不需要再传参数了
+	r.POST("/register", handlers.Register)
+	r.POST("/login", handlers.Login)
+	r.GET("/ws", handlers.HandleWS()) // WebSocket 入口
+
+	// --- 5. 需要认证的 API 组 ---
+
+	// 创建一个名为 /api 的组，并挂载身份验证中间件
 	api := r.Group("/api")
 	api.Use(handlers.AuthMiddleware())
 	{
-		api.GET("/me", handlers.GetMe(mysqlDB))
+		// 只要在这个花括号里的接口，都必须带上合法的 Token 才能访问
+		api.GET("/me", handlers.GetMe)
 	}
 
-	// 4. 启动服务
+	// --- 6. 启动服务 ---
+
 	log.Println("👾 游戏认证服务器已启动在 :8081")
 	if err := r.Run(":8081"); err != nil {
 		log.Fatalf("❌ 服务器启动失败: %v", err)

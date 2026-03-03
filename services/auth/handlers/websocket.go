@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	// 这里的路径确保和你 go.mod 里的 module 名一致
+	"github.com/TimeCraker/game-backend-demo/services/auth/models"
 	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -63,23 +64,29 @@ func HandleWS() gin.HandlerFunc {
 		log.Printf("🔌 玩家 ID:%d 已成功进入游戏大厅连接池", userID)
 
 		// --- 🟠 第四步：消息传送阵 (Message Loop) ---
-
+		// 4. 消息循环
 		for {
-			// ReadMessage 会一直阻塞，直到客户端发消息过来
 			_, p, err := conn.ReadMessage()
 			if err != nil {
-				// 只要 Read 报错，说明连接断了（比如玩家断网了）
-				log.Printf("⚠️ 玩家 %d 连接异常，准备触发清理逻辑", userID)
+				log.Printf("⚠️ 玩家 %d 掉线", userID)
 				break
 			}
 
-			log.Printf("📩 收到来自玩家 %d 的消息: %s", userID, string(p))
+			content := string(p)
+			log.Printf("📩 收到玩家 %d 消息: %s", userID, content)
 
-			// 【核心逻辑】：不要只回发给自己，而是让大总管“广播”给所有人！
-			// 我们把消息包装成： "玩家 1 说: 消息内容"
-			broadcastContent := fmt.Sprintf("玩家 %d 说: %s", userID, string(p))
+			// --- 🟢 【核心功能】持久化：存入数据库 ---
+			// 这里的 DB 就是 base.go 里的全局变量
+			msgRecord := models.Message{
+				Sender:  fmt.Sprintf("玩家 %d", userID),
+				Content: content,
+			}
+			if err := DB.Create(&msgRecord).Error; err != nil {
+				log.Printf("❌ 消息存入数据库失败: %v", err)
+			}
 
-			// 呼叫大总管，全服通告
+			// 5. 广播
+			broadcastContent := fmt.Sprintf("%s 说: %s", msgRecord.Sender, msgRecord.Content)
 			GlobalHub.Broadcast([]byte(broadcastContent))
 		}
 	}

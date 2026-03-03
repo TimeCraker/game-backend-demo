@@ -3,8 +3,10 @@ package db
 import (
 	"context"
 	"fmt"
-	"github.com/redis/go-redis/v9"
+	"log"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // RDB 全局变量，方便在 handlers 里面直接调用
@@ -28,7 +30,7 @@ func InitRedis() {
 		panic(fmt.Sprintf("Redis 连接失败: %v", err))
 	}
 
-	fmt.Println("🚀 [Redis] 已就绪，连接成功！")
+	log.Println("🚀 [Redis] 已就绪，连接成功！")
 }
 
 // 辅助函数：将用户标记为在线
