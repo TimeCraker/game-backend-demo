@@ -1,7 +1,7 @@
 package handlers
 
 import (
-	"encoding/json" // 【更新】引入 JSON 解析库
+	"encoding/json" // 引入 JSON 解析库
 	"fmt"
 	"log"
 	"net/http"
@@ -12,7 +12,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// 【更新】GameMessage 定义了客户端发来的统一 JSON 指令格式
+// GameMessage 定义了客户端发来的统一 JSON 指令格式
 type GameMessage struct {
 	Type    string  `json:"type"`    // 消息类型: "chat" 或 "move"
 	Content string  `json:"content"` // 聊天内容
@@ -35,20 +35,20 @@ func HandleWS() gin.HandlerFunc {
 
 		tokenString := c.Query("token")
 		if tokenString == "" {
-			log.Println("❌ 拒绝连接：没带 Token")
+			log.Println("❌ 拒绝连接：缺少 Token")
 			return
 		}
 
 		claims, err := utils.ParseToken(tokenString)
 		if err != nil {
-			log.Printf("❌ 拒绝连接：Token 伪造或过期: %v", err)
+			log.Printf("❌ 拒绝连接：Token 无效: %v", err)
 			return
 		}
 
 		// 统一使用 uint 类型，方便数据库 models 操作
 		userID := uint(claims.UserID)
 
-		// --- 🟡 第二步：协议大升级 (Upgrade) ---
+		// --- 🟡 第二步：协议升级 (Upgrade) ---
 
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
@@ -56,16 +56,24 @@ func HandleWS() gin.HandlerFunc {
 			return
 		}
 
-		// --- 🔵 第三步：登记与清理 (Management) ---
+		// --- 🔵 第三步：连接管理 (Management) ---
 
 		// 1. 进门登记：显式转为 int 适配 Hub 现有的字典类型
 		GlobalHub.Register(int(userID), conn)
+
+		// 同步当前在线的所有玩家位置给这个刚进入的玩家
+		syncWorldState(conn, userID)
 
 		// 2. 离场清理：使用一个 defer 函数包裹所有“身后事”
 		defer func() {
 			GlobalHub.Unregister(int(userID)) // 显式转为 int 适配 Hub
 			conn.Close()                      // 切断物理连接
-			log.Printf("👤 玩家 %d 的连接已释放，清理完毕", userID)
+
+			// 广播下线通知：告诉所有人这个玩家走了，客户端应销毁对应模型
+			leaveMsg := fmt.Sprintf("{\"type\":\"leave\",\"user_id\":%d}", userID)
+			GlobalHub.Broadcast([]byte(leaveMsg))
+
+			log.Printf("👤 玩家 %d 的连接已释放，已广播离开消息", userID)
 		}()
 
 		log.Printf("🔌 玩家 ID:%d 已成功进入游戏大厅连接池", userID)
@@ -78,7 +86,7 @@ func HandleWS() gin.HandlerFunc {
 				break
 			}
 
-			// --- 【更新点】解析 JSON 指令 ---
+			// --- 解析 JSON 指令 ---
 			var incoming GameMessage
 			if err := json.Unmarshal(p, &incoming); err != nil {
 				log.Printf("⚠️ 收到非标准格式消息: %s", string(p))
@@ -98,6 +106,28 @@ func HandleWS() gin.HandlerFunc {
 			}
 		}
 	}
+}
+
+// 给新连入的玩家发送当前世界所有玩家的位置快照
+func syncWorldState(conn *websocket.Conn, currentUserID uint) {
+	var positions []models.PlayerPosition
+	// 从数据库中查询所有玩家的最新位置
+	DB.Find(&positions)
+
+	// 定义初始化消息结构
+	type InitMsg struct {
+		Type    string                  `json:"type"`
+		Players []models.PlayerPosition `json:"players"`
+	}
+
+	data := InitMsg{
+		Type:    "init_players",
+		Players: positions,
+	}
+
+	payload, _ := json.Marshal(data)
+	// 将快照只发给当前这一个连接
+	_ = conn.WriteMessage(websocket.TextMessage, payload)
 }
 
 // handleChatLogic 处理聊天业务，接收 uint 类型的 userID
@@ -123,12 +153,12 @@ func handleMoveLogic(userID uint, x, y, z float64) {
 		Y:      y,
 		Z:      z,
 	}
+	// 使用 FirstOrCreate 配合 Assign 实现 Upsert 逻辑
 	DB.Where(models.PlayerPosition{UserID: userID}).Assign(newPos).FirstOrCreate(&models.PlayerPosition{})
 
 	// 2. 广播坐标给其他玩家，使用标准 JSON 格式
 	moveData := fmt.Sprintf("{\"type\":\"move\",\"user_id\":%d,\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}", userID, x, y, z)
 	GlobalHub.Broadcast([]byte(moveData))
 
-	// 【恢复显示】终端现在会打印移动日志了 测试专用 去除注释即可
-	//log.Printf("🏃 玩家 %d 移动至 (%.2f, %.2f, %.2f)", userID, x, y, z)
+	// log.Printf("🏃 玩家 %d 移动至 (%.2f, %.2f, %.2f)", userID, x, y, z)
 }
