@@ -5,11 +5,18 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time" // 引入时间库用于心跳控制
 
 	"github.com/TimeCraker/game-backend-demo/services/auth/models"
 	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+)
+
+// 心跳配置常量：用于稳定性保障，防止僵尸连接
+const (
+	pingPeriod = 20 * time.Second // 每 20 秒发送一次 Ping
+	pongWait   = 60 * time.Second // 60 秒内没收到 Pong 则认为掉线
 )
 
 // GameMessage 定义了客户端发来的统一 JSON 指令格式
@@ -61,34 +68,59 @@ func HandleWS() gin.HandlerFunc {
 		// 1. 进门登记：显式转为 int 适配 Hub 现有的字典类型
 		GlobalHub.Register(int(userID), conn)
 
-		// 同步当前在线的所有玩家位置给这个刚进入的玩家
+		// 同步最近 10 条聊天记录（【聊天回溯】），让大厅不冷清
+		syncChatHistory(conn)
+
+		// 同步当前在线的所有玩家位置给这个刚进入的玩家（功能 A）
 		syncWorldState(conn, userID)
+
+		// 稳定性保障：【配置心跳】感应与读取限制
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		conn.SetPongHandler(func(string) error {
+			// 收到玩家回复的 Pong，刷新生存截止时间
+			conn.SetReadDeadline(time.Now().Add(pongWait))
+			return nil
+		})
+
+		// 【启动心跳】协程：定期主动询问客户端是否在线
+		go func(conn *websocket.Conn) {
+			ticker := time.NewTicker(pingPeriod)
+			defer ticker.Stop()
+			for range ticker.C {
+				// 发送 Ping 消息（二进制底层包）
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return // 发送失败通常意味着连接已断开，协程退出
+				}
+			}
+		}(conn)
 
 		// 2. 离场清理：使用一个 defer 函数包裹所有“身后事”
 		defer func() {
 			GlobalHub.Unregister(int(userID)) // 显式转为 int 适配 Hub
 			conn.Close()                      // 切断物理连接
 
-			// 广播下线通知：告诉所有人这个玩家走了，客户端应销毁对应模型
+			// 广播下线通知：告诉所有人这个玩家走了，客户端应销毁对应模型（功能 C）
 			leaveMsg := fmt.Sprintf("{\"type\":\"leave\",\"user_id\":%d}", userID)
 			GlobalHub.Broadcast([]byte(leaveMsg))
 
-			log.Printf("👤 玩家 %d 的连接已释放，已广播离开消息", userID)
+			log.Printf("👤 玩家 %d 的连接已释放，已广播离开消息并清理资源", userID)
 		}()
 
-		log.Printf("🔌 玩家 ID:%d 已成功进入游戏大厅连接池", userID)
+		log.Printf("🔌 玩家 ID:%d 已成功进入游戏大厅连接池，心跳监测已启动", userID)
 
 		// --- 🟠 第四步：消息传送阵 (Message Loop) ---
 		for {
 			_, p, err := conn.ReadMessage()
 			if err != nil {
-				log.Printf("⚠️ 玩家 %d 掉线", userID)
+				// 这里的报错通常包含连接正常关闭、强制关闭或心跳超时
+				log.Printf("⚠️ 玩家 %d 掉线或连接超时", userID)
 				break
 			}
 
-			// --- 解析 JSON 指令 ---
+			// --- 【更新点】解析 JSON 指令 ---
 			var incoming GameMessage
 			if err := json.Unmarshal(p, &incoming); err != nil {
+				// 如果解析失败，说明不是标准的 JSON 指令
 				log.Printf("⚠️ 收到非标准格式消息: %s", string(p))
 				continue
 			}
@@ -108,7 +140,27 @@ func HandleWS() gin.HandlerFunc {
 	}
 }
 
-// 给新连入的玩家发送当前世界所有玩家的位置快照
+// 同步最近的历史聊天记录
+func syncChatHistory(conn *websocket.Conn) {
+	var msgs []models.Message
+	// 从数据库按 ID 倒序取 10 条，让新上线的玩家看到最近的对话
+	DB.Order("id desc").Limit(10).Find(&msgs)
+
+	type ChatHistoryMsg struct {
+		Type    string           `json:"type"`
+		History []models.Message `json:"history"`
+	}
+
+	data := ChatHistoryMsg{
+		Type:    "chat_history",
+		History: msgs,
+	}
+
+	payload, _ := json.Marshal(data)
+	_ = conn.WriteMessage(websocket.TextMessage, payload)
+}
+
+// 给新连入的玩家发送当前世界所有玩家的位置快照（功能 A）
 func syncWorldState(conn *websocket.Conn, currentUserID uint) {
 	var positions []models.PlayerPosition
 	// 从数据库中查询所有玩家的最新位置
@@ -160,5 +212,6 @@ func handleMoveLogic(userID uint, x, y, z float64) {
 	moveData := fmt.Sprintf("{\"type\":\"move\",\"user_id\":%d,\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}", userID, x, y, z)
 	GlobalHub.Broadcast([]byte(moveData))
 
+	// 保留测试用注释：
 	// log.Printf("🏃 玩家 %d 移动至 (%.2f, %.2f, %.2f)", userID, x, y, z)
 }
