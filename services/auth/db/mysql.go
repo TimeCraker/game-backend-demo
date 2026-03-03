@@ -21,7 +21,7 @@ func InitMySQL() {
 	}
 
 	// 自动迁移：把所有的模型都在这里登记
-	err = db.AutoMigrate(&models.User{}, &models.Message{})
+	err = db.AutoMigrate(&models.User{}, &models.Message{}, &models.PlayerPosition{})
 	if err != nil {
 		log.Fatalf("❌ 数据库自动迁移失败: %v", err)
 	}
