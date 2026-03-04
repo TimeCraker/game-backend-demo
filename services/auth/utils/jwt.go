@@ -14,13 +14,14 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
-// GenerateToken 生成 JWT token，有效期24小时
+// GenerateToken 生成 JWT token，有效期改为 72 小时
 // 【修改点】参数也改为 int
 func GenerateToken(userID int) (string, error) {
 	claims := Claims{
 		UserID: userID, // 显式指定字段名更清晰
 		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+			// 🟢 这里从 24 改为 72 小时
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(72 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
 	}

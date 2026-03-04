@@ -42,6 +42,7 @@ func Login(c *gin.Context) {
 	}
 
 	// 4. 生成 JWT Token (颁发 VIP 胸牌)
+	// 🟢 这里会自动调用上面定义的 72 小时逻辑
 	token, err := utils.GenerateToken(int(user.ID))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token生成失败"})

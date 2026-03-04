@@ -1,32 +1,32 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
+# --- 临时测试与私有文件夹 ---
+# 忽略整个 tests 文件夹，因为它只包含开发时的临时测试脚本
+tests/
+
+# --- 编译生成的二进制程序 (Binaries) ---
+# 忽略 Windows 下编译出的执行文件
 *.exe
 *.exe~
+# 忽略动态链接库（后面 Unity 可能会用到，但在后端代码仓库里不需要它）
 *.dll
 *.so
 *.dylib
 
-# Test binary, built with `go test -c`
-*.test
+# --- 敏感信息与配置 ---
+# 忽略本地的环境变量配置文件（防止泄露数据库密码等）
+.env
 
-# Code coverage profiles and other test artifacts
+# --- Go 语言特有的临时文件 ---
+# 忽略 Go 单元测试生成的二进制和覆盖率报告
+*.test
 *.out
 coverage.*
 *.coverprofile
-profile.cov
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# --- 编辑器缓存 ---
+# 忽略 VS Code 和 JetBrains (Goland) 的配置文件夹
+.vscode/
+.idea/
 
-# Go workspace file
-go.work
-go.work.sum
-
-# env file
-.env
-
-# Editor/IDE
-# .idea/
-# .vscode/
+# --- 操作系统生成的垃圾文件 ---
+# 忽略 Windows 文件夹图标缓存
+Thumbs.db
