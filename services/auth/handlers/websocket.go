@@ -1,36 +1,29 @@
 package handlers
 
 import (
-	"encoding/json" // 引入 JSON 解析库
 	"fmt"
 	"log"
 	"net/http"
-	"time" // 引入时间库用于心跳控制
+	"time"
 
 	"github.com/TimeCraker/game-backend-demo/services/auth/models"
 	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+
+	// 【Protobuf】引入 Protobuf 核心库和生成的协议包
+	pb "github.com/TimeCraker/game-backend-demo/services/auth/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // 心跳配置常量：用于稳定性保障，防止僵尸连接
 const (
-	pingPeriod = 20 * time.Second // 每 20 秒发送一次 Ping
-	pongWait   = 60 * time.Second // 60 秒内没收到 Pong 则认为掉线
+	pingPeriod = 20 * time.Second
+	pongWait   = 60 * time.Second
 )
-
-// GameMessage 定义了客户端发来的统一 JSON 指令格式
-type GameMessage struct {
-	Type    string  `json:"type"`    // 消息类型: "chat" 或 "move"
-	Content string  `json:"content"` // 聊天内容
-	X       float64 `json:"x"`       // 坐标 X
-	Y       float64 `json:"y"`       // 坐标 Y
-	Z       float64 `json:"z"`       // 坐标 Z
-}
 
 // Upgrader 负责把普通的 HTTP 请求“升级”成长连接
 var upgrader = websocket.Upgrader{
-	// 允许跨域（生产环境可以限制域名，开发环境设为 true 方便调试）
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
@@ -39,7 +32,6 @@ var upgrader = websocket.Upgrader{
 func HandleWS() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// --- 🟢 第一步：身份大检查 (Authentication) ---
-
 		tokenString := c.Query("token")
 		if tokenString == "" {
 			log.Println("❌ 拒绝连接：缺少 Token")
@@ -52,11 +44,9 @@ func HandleWS() gin.HandlerFunc {
 			return
 		}
 
-		// 统一使用 uint 类型，方便数据库 models 操作
 		userID := uint(claims.UserID)
 
 		// --- 🟡 第二步：协议升级 (Upgrade) ---
-
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
 			log.Printf("❌ 协议升级失败: %v", err)
@@ -64,153 +54,164 @@ func HandleWS() gin.HandlerFunc {
 		}
 
 		// --- 🔵 第三步：连接管理 (Management) ---
-
-		// 1. 进门登记：显式转为 int 适配 Hub 现有的字典类型
 		GlobalHub.Register(int(userID), conn)
 
-		// 同步最近 10 条聊天记录（【聊天回溯】），让大厅不冷清
+		// 同步最近 10 条聊天记录（聊天回溯）
 		syncChatHistory(conn)
 
 		// 同步当前在线的所有玩家位置给这个刚进入的玩家（功能 A）
 		syncWorldState(conn, userID)
 
-		// 稳定性保障：【配置心跳】感应与读取限制
+		// 稳定性保障：配置心跳感应与读取限制
 		conn.SetReadDeadline(time.Now().Add(pongWait))
 		conn.SetPongHandler(func(string) error {
-			// 收到玩家回复的 Pong，刷新生存截止时间
 			conn.SetReadDeadline(time.Now().Add(pongWait))
 			return nil
 		})
 
-		// 【启动心跳】协程：定期主动询问客户端是否在线
+		// 启动心跳协程
 		go func(conn *websocket.Conn) {
 			ticker := time.NewTicker(pingPeriod)
 			defer ticker.Stop()
 			for range ticker.C {
-				// 发送 Ping 消息（二进制底层包）
 				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					return // 发送失败通常意味着连接已断开，协程退出
+					return
 				}
 			}
 		}(conn)
 
-		// 2. 离场清理：使用一个 defer 函数包裹所有“身后事”
+		// 2. 离场清理
 		defer func() {
-			GlobalHub.Unregister(int(userID)) // 显式转为 int 适配 Hub
-			conn.Close()                      // 切断物理连接
+			GlobalHub.Unregister(int(userID))
+			conn.Close()
 
-			// 广播下线通知：告诉所有人这个玩家走了，客户端应销毁对应模型（功能 C）
-			leaveMsg := fmt.Sprintf("{\"type\":\"leave\",\"user_id\":%d}", userID)
-			GlobalHub.Broadcast([]byte(leaveMsg))
+			// 【更新功能：Protobuf】使用二进制格式广播下线
+			leaveMsg := &pb.GameMessage{
+				Type:   "leave",
+				UserId: uint32(userID),
+			}
+			payload, _ := proto.Marshal(leaveMsg)
+			GlobalHub.Broadcast(payload)
 
 			log.Printf("👤 玩家 %d 的连接已释放，已广播离开消息并清理资源", userID)
 		}()
 
-		log.Printf("🔌 玩家 ID:%d 已成功进入游戏大厅连接池，心跳监测已启动", userID)
+		log.Printf("🔌 玩家 ID:%d 已成功进入游戏大厅，[Protobuf 模式启动]", userID)
 
 		// --- 🟠 第四步：消息传送阵 (Message Loop) ---
 		for {
 			_, p, err := conn.ReadMessage()
 			if err != nil {
-				// 这里的报错通常包含连接正常关闭、强制关闭或心跳超时
 				log.Printf("⚠️ 玩家 %d 掉线或连接超时", userID)
 				break
 			}
 
-			// --- 【更新点】解析 JSON 指令 ---
-			var incoming GameMessage
-			if err := json.Unmarshal(p, &incoming); err != nil {
-				// 如果解析失败，说明不是标准的 JSON 指令
-				log.Printf("⚠️ 收到非标准格式消息: %s", string(p))
+			// --- 【Protobuf】解析二进制指令 ---
+			incoming := &pb.GameMessage{}
+			if err := proto.Unmarshal(p, incoming); err != nil {
+				log.Printf("⚠️ 收到损坏的二进制包: %v", err)
 				continue
 			}
 
 			// 根据消息类型进行分流处理
 			switch incoming.Type {
 			case "chat":
-				// 处理聊天逻辑
 				handleChatLogic(userID, incoming.Content)
 			case "move":
-				// 处理移动逻辑
-				handleMoveLogic(userID, incoming.X, incoming.Y, incoming.Z)
+				handleMoveLogic(userID, float64(incoming.X), float64(incoming.Y), float64(incoming.Z))
 			default:
-				log.Printf("❓ 未知指令类型: %s", incoming.Type)
+				log.Printf("❓ 未知二进制指令类型: %s", incoming.Type)
 			}
 		}
 	}
 }
 
-// 同步最近的历史聊天记录
+// 【Protobuf】同步聊天历史
 func syncChatHistory(conn *websocket.Conn) {
 	var msgs []models.Message
-	// 从数据库按 ID 倒序取 10 条，让新上线的玩家看到最近的对话
 	DB.Order("id desc").Limit(10).Find(&msgs)
 
-	type ChatHistoryMsg struct {
-		Type    string           `json:"type"`
-		History []models.Message `json:"history"`
+	// 将数据库模型转换为 Protobuf 列表
+	var pbHistory []*pb.ChatLog
+	for _, m := range msgs {
+		pbHistory = append(pbHistory, &pb.ChatLog{
+			Sender:  m.Sender,
+			Content: m.Content,
+		})
 	}
 
-	data := ChatHistoryMsg{
+	data := &pb.GameMessage{
 		Type:    "chat_history",
-		History: msgs,
+		History: pbHistory,
 	}
 
-	payload, _ := json.Marshal(data)
-	_ = conn.WriteMessage(websocket.TextMessage, payload)
+	payload, _ := proto.Marshal(data)
+	// 【更新】使用 BinaryMessage 发送二进制流
+	_ = conn.WriteMessage(websocket.BinaryMessage, payload)
 }
 
-// 给新连入的玩家发送当前世界所有玩家的位置快照（功能 A）
+// 【更新功能：Protobuf】同步世界位置快照
 func syncWorldState(conn *websocket.Conn, currentUserID uint) {
 	var positions []models.PlayerPosition
-	// 从数据库中查询所有玩家的最新位置
 	DB.Find(&positions)
 
-	// 定义初始化消息结构
-	type InitMsg struct {
-		Type    string                  `json:"type"`
-		Players []models.PlayerPosition `json:"players"`
+	var pbPlayers []*pb.PlayerPos
+	for _, p := range positions {
+		pbPlayers = append(pbPlayers, &pb.PlayerPos{
+			UserId: uint32(p.UserID),
+			X:      float32(p.X),
+			Y:      float32(p.Y),
+			Z:      float32(p.Z),
+		})
 	}
 
-	data := InitMsg{
+	data := &pb.GameMessage{
 		Type:    "init_players",
-		Players: positions,
+		Players: pbPlayers,
 	}
 
-	payload, _ := json.Marshal(data)
-	// 将快照只发给当前这一个连接
-	_ = conn.WriteMessage(websocket.TextMessage, payload)
+	payload, _ := proto.Marshal(data)
+	_ = conn.WriteMessage(websocket.BinaryMessage, payload)
 }
 
-// handleChatLogic 处理聊天业务，接收 uint 类型的 userID
+// 【Protobuf】处理聊天业务
 func handleChatLogic(userID uint, content string) {
-	// 持久化：存入数据库
 	msgRecord := models.Message{
 		Sender:  fmt.Sprintf("玩家 %d", userID),
 		Content: content,
 	}
 	DB.Create(&msgRecord)
 
-	// 广播消息
-	resp := fmt.Sprintf("{\"type\":\"chat\",\"sender\":\"玩家 %d\",\"content\":\"%s\"}", userID, content)
-	GlobalHub.Broadcast([]byte(resp))
+	// 构造 Protobuf 响应包
+	resp := &pb.GameMessage{
+		Type:    "chat",
+		Content: content,
+		UserId:  uint32(userID),
+	}
+	payload, _ := proto.Marshal(resp)
+	GlobalHub.Broadcast(payload)
 }
 
-// handleMoveLogic 处理玩家移动业务，接收 uint 类型的 userID
+// 【Protobuf】处理玩家移动业务
 func handleMoveLogic(userID uint, x, y, z float64) {
-	// 1. 更新数据库坐标（存在则更新，不存在则创建）
 	newPos := models.PlayerPosition{
 		UserID: userID,
 		X:      x,
 		Y:      y,
 		Z:      z,
 	}
-	// 使用 FirstOrCreate 配合 Assign 实现 Upsert 逻辑
 	DB.Where(models.PlayerPosition{UserID: userID}).Assign(newPos).FirstOrCreate(&models.PlayerPosition{})
 
-	// 2. 广播坐标给其他玩家，使用标准 JSON 格式
-	moveData := fmt.Sprintf("{\"type\":\"move\",\"user_id\":%d,\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}", userID, x, y, z)
-	GlobalHub.Broadcast([]byte(moveData))
+	// 构造二进制广播包
+	moveData := &pb.GameMessage{
+		Type:   "move",
+		UserId: uint32(userID),
+		X:      float32(x),
+		Y:      float32(y),
+		Z:      float32(z),
+	}
+	payload, _ := proto.Marshal(moveData)
+	GlobalHub.Broadcast(payload)
 
 	// 保留测试用注释：
 	// log.Printf("🏃 玩家 %d 移动至 (%.2f, %.2f, %.2f)", userID, x, y, z)

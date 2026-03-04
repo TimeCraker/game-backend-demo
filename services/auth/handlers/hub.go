@@ -36,8 +36,9 @@ func (h *Hub) Unregister(userID int) {
 func (h *Hub) Broadcast(message []byte) {
 	h.Clients.Range(func(key, value interface{}) bool {
 		conn := value.(*websocket.Conn)
-		// 给每个连接发消息
-		_ = conn.WriteMessage(websocket.TextMessage, message)
-		return true // 继续迭代下一个
+		// 【关键修改点】将 TextMessage 改为 BinaryMessage
+		// 这样客户端接收到数据后，才会尝试按照 Protobuf 格式解析，而不是解析成字符串
+		_ = conn.WriteMessage(websocket.BinaryMessage, message)
+		return true
 	})
 }

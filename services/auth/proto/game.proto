@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+// 生成的 Go 代码所在的包名
+package proto;
+option go_package = "./proto";
+
+// 定义统一的消息包（替代之前的 GameMessage JSON）
+message GameMessage {
+    string type = 1;     // 消息类型: chat, move, init, leave
+    uint32 user_id = 2;  // 玩家 ID
+    string content = 3;  // 聊天内容
+    float x = 4;         // 坐标 X
+    float y = 5;         // 坐标 Y
+    float z = 6;         // 坐标 Z
+    
+    // 列表类型：用于同步历史记录或玩家列表
+    repeated PlayerPos players = 7;
+    repeated ChatLog history = 8;
+}
+
+message PlayerPos {
+    uint32 user_id = 1;
+    float x = 2;
+    float y = 3;
+    float z = 4;
+}
+
+message ChatLog {
+    string sender = 1;
+    string content = 2;
+}
