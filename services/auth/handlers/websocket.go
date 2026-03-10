@@ -87,7 +87,7 @@ func HandleWS() gin.HandlerFunc {
 
 			// 【更新功能：Protobuf】使用二进制格式广播下线
 			leaveMsg := &pb.GameMessage{
-				Type:   "leave",
+				Type:   "logout",
 				UserId: uint32(userID),
 			}
 			payload, _ := proto.Marshal(leaveMsg)
