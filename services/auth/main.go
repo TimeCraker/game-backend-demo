@@ -10,24 +10,15 @@ import (
 
 func main() {
 	// --- 1. 数据库模块初始化 ---
-
-	// 初始化 MySQL (内部包含连接和 AutoMigrate)
 	db.InitMySQL()
-
-	// 初始化 Redis
 	db.InitRedis()
 
 	// --- 2. 核心交接：全局变量赋值 ---
-
-	// 【重点】把 db 包里的连接交给 handlers 包的全局变量 DB
-	// 这样 websocket.go 和其他 handler 就能直接用 handlers.DB 了
 	handlers.DB = db.SQLDB
 
 	// --- 3. 启动 Gin 引擎 ---
-
 	r := gin.Default()
 
-	// 健康检查接口：让运维或 Docker 知道服务状态
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"status": "up",
@@ -38,25 +29,32 @@ func main() {
 
 	// --- 4. 路由注册 ---
 
-	// 注意：因为使用了全局 handlers.DB，函数后面不需要再传参数了
-	r.POST("/register", handlers.Register)
-	r.POST("/login", handlers.Login)
-	r.GET("/ws", handlers.HandleWS()) // WebSocket 入口
+	// ===== 新增代码 START =====
+	// 根据你的建议，将基础功能统一放入 v1 组中管理
+	v1 := r.Group("/api/v1")
+	{
+		// 基础账号功能（注册、登录）
+		v1.POST("/register", handlers.Register)
+		v1.POST("/login", handlers.Login)
+		// 新增：邮箱验证码接口
+		v1.POST("/send-code", handlers.SendEmailCode)
+	}
+	// ===== 新增代码 END =====
 
-	// --- 5. 需要认证的 API 组 ---
-
-	// 创建一个名为 /api 的组，并挂载身份验证中间件
+	// 原有的认证组功能
 	api := r.Group("/api")
 	api.Use(handlers.AuthMiddleware())
 	{
-		// 只要在这个花括号里的接口，都必须带上合法的 Token 才能访问
+		// 只有带 Token 的请求才能访问 /api/me
 		api.GET("/me", handlers.GetMe)
 	}
 
-	// --- 6. 启动服务 ---
+	// WebSocket 入口
+	r.GET("/ws", handlers.HandleWS())
 
-	log.Println("👾 游戏认证服务器已启动在 :8081")
+	// --- 5. 跑起来！ ---
+	log.Println("👾 游戏认证后端已在 :8081 启动")
 	if err := r.Run(":8081"); err != nil {
-		log.Fatalf("❌ 服务器启动失败: %v", err)
+		log.Fatalf("❌ 服务启动失败: %v", err)
 	}
 }
