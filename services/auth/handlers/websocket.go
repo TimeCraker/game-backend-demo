@@ -151,27 +151,40 @@ func syncChatHistory(conn *websocket.Conn) {
 }
 
 // 【更新功能：Protobuf】同步世界位置快照
+// 【修复Bug】修改查询逻辑，现在只同步当前 GlobalHub 中实际在线的玩家，过滤掉已下线的“幽灵”
 func syncWorldState(conn *websocket.Conn, currentUserID uint) {
-	var positions []models.PlayerPosition
-	DB.Find(&positions)
-
 	var pbPlayers []*pb.PlayerPos
-	for _, p := range positions {
-		pbPlayers = append(pbPlayers, &pb.PlayerPos{
-			UserId: uint32(p.UserID),
-			X:      float32(p.X),
-			Y:      float32(p.Y),
-			Z:      float32(p.Z),
-		})
-	}
 
-	data := &pb.GameMessage{
-		Type:    "init_players",
-		Players: pbPlayers,
-	}
+	// 遍历大总管名单，只找当前在线的玩家
+	GlobalHub.Clients.Range(func(key, value interface{}) bool {
+		onlineUserID := uint(key.(int))
 
-	payload, _ := proto.Marshal(data)
-	_ = conn.WriteMessage(websocket.BinaryMessage, payload)
+		// 排除掉自己，只同步别人的位置
+		if onlineUserID != currentUserID {
+			var pos models.PlayerPosition
+			// 去数据库里查这个在线玩家的最新坐标
+			if err := DB.Where("user_id = ?", onlineUserID).First(&pos).Error; err == nil {
+				pbPlayers = append(pbPlayers, &pb.PlayerPos{
+					UserId: uint32(pos.UserID),
+					X:      float32(pos.X),
+					Y:      float32(pos.Y),
+					Z:      float32(pos.Z),
+				})
+			}
+		}
+		return true
+	})
+
+	// 只有当存在其他在线玩家时，才发送初始化包
+	if len(pbPlayers) > 0 {
+		data := &pb.GameMessage{
+			Type:    "init_players",
+			Players: pbPlayers,
+		}
+
+		payload, _ := proto.Marshal(data)
+		_ = conn.WriteMessage(websocket.BinaryMessage, payload)
+	}
 }
 
 // 【Protobuf】处理聊天业务
