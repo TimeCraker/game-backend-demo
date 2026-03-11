@@ -3,20 +3,23 @@ package handlers
 import (
 	"net/http"
 
+	"github.com/TimeCraker/game-backend-demo/services/auth/db"
+
 	"github.com/TimeCraker/game-backend-demo/services/auth/models"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
-	// 注意：这里不再需要导入 gorm，因为我们直接用 base.go 里的 DB
 )
 
 // RegisterRequest 定义了注册请求的 JSON 格式
 type RegisterRequest struct {
 	Username string `json:"username" binding:"required"`
 	Password string `json:"password" binding:"required"`
+	// 新增邮箱和验证码字段
+	Email string `json:"email" binding:"required,email"`
+	Code  string `json:"code" binding:"required,len=6"`
 }
 
 // Register 处理用户注册逻辑
-// 【改动点】现在它直接作为 gin 的 Handler，不需要返回闭包了
 func Register(c *gin.Context) {
 	var req RegisterRequest
 
@@ -26,18 +29,32 @@ func Register(c *gin.Context) {
 		return
 	}
 
+	// 1.5 从 Redis 校验验证码 (使用 db.RDB 和 db.Ctx)
+	expectedCode, err := db.RDB.Get(db.Ctx, "register_code:"+req.Email).Result()
+	if err != nil || expectedCode != req.Code {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "验证码错误或已过期"})
+		return
+	}
+	// 验证成功后立即删除，防止单码多次注册
+	db.RDB.Del(db.Ctx, "register_code:"+req.Email)
+
 	// 2. 检查用户名是否已存在
 	var existingUser models.User
-	// 【改动点】这里直接使用全局变量 DB (来自 base.go)
 	if err := DB.Where("username = ?", req.Username).First(&existingUser).Error; err == nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "该用户名已被占用"})
 		return
 	}
 
-	// 3. 加密密码 (使用 bcrypt 算法)
+	// 2.5 检查邮箱是否已被注册
+	if err := DB.Where("email = ?", req.Email).First(&existingUser).Error; err == nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "该邮箱已被注册"})
+		return
+	}
+
+	// 3. 加密密码
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器内部错误：密码加密失败"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器内部错误"})
 		return
 	}
 
@@ -45,15 +62,14 @@ func Register(c *gin.Context) {
 	user := models.User{
 		Username: req.Username,
 		Password: string(hashedPassword),
+		Email:    req.Email,
 	}
 
-	// 【改动点】直接使用全局 DB 进行创建
 	if err := DB.Create(&user).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器内部错误：用户保存失败"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "用户保存失败"})
 		return
 	}
 
-	// 5. 返回成功响应
 	c.JSON(http.StatusCreated, gin.H{
 		"id":      user.ID,
 		"message": "恭喜！玩家账号创建成功",
