@@ -1,117 +1,59 @@
-📅 游戏后端 Demo 逐日通关计划（1.0版）
-第一阶段：账号与基建（Week 1）
-这一阶段的目标是：让玩家能注册、登录，且服务器知道“谁在线”。
+全栈游戏后端开发里程碑（3.0 终极架构版）
+第一阶段：核心地基与高维安全 (Completed ✅)
+[x] Day 1-2: 环境搭建与持久化。MySQL/Redis 容器化，GORM 接入，Bcrypt 密码加密。
 
-Day 1：环境闭环（已完成 ✅）
+[x] Day 3-4: 会话安全。JWT 鉴权中间件编写，实现 Header 拦截与路由保护 (/api/me)。
 
-安装 Go, WSL2, Docker。
+[x] Day 5-6: 工业级注册流。整合 SMTP 协议，实现带精美 HTML 模板的验证码邮件投递。
 
-配置 docker-compose.yml (MySQL, Redis)。
+[x] Day 7: 缓存防御。基于 Redis 实现邮箱验证码的 60s 冷却与每日 5 次限流，防止接口被刷。
 
-初始化 go mod，建立 services/auth 基础目录。
+第二阶段：长连接大厅与协议进化 (Completed ✅)
+[x] Day 8-9: WebSocket 握手与心跳。Gorilla 协议升级，建立 GlobalHub，20s Ping / 60s Pong 踢出僵尸连接。
 
-Day 2：持久化注册（已完成 ✅）
+[x] Day 10-11: 二进制协议升级。全面引入 Google Protobuf 替代 JSON，定义 game.proto，网络带宽消耗降低 60%。
 
-引入 GORM，定义 User 模型。
+[x] Day 12-13: 全服状态广播。实现玩家上线快照同步 (init_players)、移动广播 (move)、离线清理 (logout) 与聊天流回溯。
 
-实现 POST /register：使用 bcrypt 哈希加密存储密码。
+[x] Day 14-15: Unity 基础接入。C# 异步消息队列处理，Vector3.MoveTowards 平滑插值，3D NameTag 动态渲染。
 
-实现 POST /login：比对密码并下发 JWT Token。
+第三阶段：网关引入与 UI 闭环 (Ongoing 🚀)
+[ ] Day 16-17: API Gateway 搭建
 
-Day 3：状态感知（今日任务 🚀）
+新增 Gateway 服务，作为全网唯一入口。
 
-步骤1：编写 internal/common/db/redis.go 初始化连接池。
+将 HTTP 路由反向代理至内网 Auth 服务，WebSocket 路由代理至 Game 服务进程。
 
-步骤2：登录成功后，将 user_id 存入 Redis（Key: online_users:{id}, Value: token），设置 24h 过期。
+[ ] Day 18-19: Unity 业务面板开发
 
-步骤3：实现 GET /api/status/:id 接口，直接查 Redis 返回该用户是否在线。
+UGUI 制作带 UI 的登录/注册/验证码收发界面。
 
-Day 4：鉴权中间件与用户画像
+UnityWebRequest 接入 HTTP 接口，动态缓存 JWT Token 用于场景切换。
 
-完善 AuthMiddleware：从 Header 取出 Bearer <token> 并解析。
+[ ] Day 20: 剥离硬编码与配置化
 
-实现 GET /api/me：通过 Token 解析出的 UID，去数据库查出昵称、等级。
+将 Go 和 Unity 中的 IP、端口、密钥全部抽离为 .env 和 ScriptableObject 配置中心。
 
-Day 5：代码整改与日志
+第四阶段：跨平台特化与异常处理 (Upcoming 🕒)
+[ ] Day 21-22: WebGL 架构特化
 
-引入 zap 或 logrus 日志库（别再满屏 fmt.Println 了，面试官不喜欢）。
+引入 NativeWebSocket，通过 #if UNITY_WEBGL 宏定义解决原生网络库在网页端的崩溃问题。
 
-统一 API 返回格式：{"code": 200, "data": {}, "msg": ""}。
+[ ] Day 23: 异常自愈机制
 
-第二阶段：长连接网关（Week 2）
-这一阶段的目标是：建立那个“打不断”的 WebSocket 通道。
+Unity 侧实现断网重连 UI、Token 过期 (401) 自动退回登录页逻辑。
 
-Day 6：WebSocket 握手
+[ ] Day 24: 移动端 Input 适配
 
-在 services/gateway 下新建服务。
+引入 Unity Input System，剥离 PC 鼠标点击逻辑，兼容手机虚拟摇杆触控。
 
-实现 /ws 接口，将 HTTP 协议升级（Upgrade）为 WebSocket。
+第五阶段：部署上线与业务裂变 (Endgame 🏆)
+[ ] Day 25-26: 云原生部署
 
-Day 7：连接池管理 (Manager)
+编写集群 docker-compose.yml。配置 Nginx 反向代理与 HTTPS/WSS 证书，上线云服务器。
 
-编写 Client 和 ClientManager 结构体。
+[ ] Day 27+: 分支裂变与 Match 匹配
 
-使用 sync.Map 存储当前所有活跃的 WebSocket 连接。
+预留 Match 匹配队列逻辑。
 
-Day 8：心跳机制（保活）
-
-服务端逻辑：每隔 5 秒向客户端发一个 Ping。
-
-清理逻辑：如果客户端 15 秒没回 Pong，强制断开连接并清理 Redis 在线状态。
-
-Day 9：ProtoBuf 协议引入
-
-安装 protoc 编译器。
-
-定义第一个协议文件 message.proto（包含消息 ID 和 Data 字段）。
-
-用二进制传输代替 JSON，这是游戏后端的门面。
-
-Day 10：网关路由转发
-
-网关收到消息后，根据消息 ID 判断该发给哪个业务模块。
-
-第三阶段：房间与同步（Week 3-4）
-这一阶段的目标是：让 A 的移动，能在 B 的屏幕上显示出来。
-
-Day 11-12：房间管理逻辑
-
-实现 CreateRoom 和 JoinRoom。
-
-一个房间对应一个 Goroutine（轻量级线程），负责处理房间内消息。
-
-Day 13-14：服务端权威同步（重点！）
-
-实现 Tick Loop（每秒 20 次循环）。
-
-服务器每 50ms 广播一次房间内所有人的位置快照。
-
-Day 15-20：Unity 客户端接入
-
-在 Unity 中编写 C# 代码连接 WebSocket。
-
-实现最基础的“方块移动同步”。
-
-
-# 📅 游戏后端开发里程碑（2.0 优化版）
-
-## 第一阶段：基建与账号 (Completed ✅)
-- [x] Day 1-2: 环境搭建、MySQL/Redis 容器化、Bcrypt 注册登录。
-- [x] Day 3: Redis 状态感知逻辑、在线/离线自动切换。
-- [x] Day 4: JWT 鉴权中间件、玩家画像接口获取。
-- [x] Day 5: 响应格式规范化、初步日志管理。
-
-## 第二阶段：实时同步与性能优化 (Ongoing 🚀)
-- [x] Day 6-7: WebSocket 握手协议、基于 JSON 的消息分流路由。
-- [x] Day 8: 玩家坐标持久化、全服位置广播实现。
-- [ ] **Next - Day 9: 稳定性保障**
-    - 实现 WS 心跳检测（Ping/Pong 机制）。
-    - 僵尸连接自动剔除逻辑。
-- [ ] **Day 10: 协议进化**
-    - 引入 Protobuf 替代 JSON，降低 60% 以上的网络带宽消耗。
-    - 定义 `message.proto` 统一消息格式。
-
-## 第三阶段：房间系统与 Unity 联调 (Upcoming 🕒)
-- [ ] Day 11-13: 房间逻辑设计（Group 广播取代全服广播）。
-- [ ] Day 14-15: 场景快照同步（AOI 算法初探，只给视野内的玩家发同步包）。
-- [ ] Day 16-20: Unity 客户端接入，实现方块人流畅同步。
+从主干框架拉出 Git 分支，正式开始研发具体的游戏玩法（如大乱斗、种田、解谜等）。
