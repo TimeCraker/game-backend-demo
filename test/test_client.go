@@ -4,8 +4,8 @@ import (
 	"log"
 	"net/url"
 
-	// 使用 pb 作为你生成的协议代码的别名
-	pb "github.com/TimeCraker/game-backend-demo/services/auth/proto"
+	// 更新 proto 导入路径
+	pb "github.com/TimeCraker/game-backend-demo/services/proto"
 	"github.com/gorilla/websocket"
 
 	// 引用 Google 官方库进行二进制转换

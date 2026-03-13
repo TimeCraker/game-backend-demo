@@ -1,0 +1,62 @@
+﻿文件夹 PATH 列表
+卷序列号为 B85E-49CE
+C:.
+|   .gitignore
+|   all_code_merged.txt
+|   docker-compose.yml
+|   go.mod
+|   go.sum
+|   project_tree.txt
+|   README.md
+|   
++---docs
+|       all_wiki_merged.txt
+|       roadmap.md
+|       
++---scripts
+|       local_down.ps1
+|       local_logs.ps1
+|       local_up.ps1
+|       
++---services
+|   +---auth
+|   |   |   main.go
+|   |   |   
+|   |   +---db
+|   |   |       mysql.go
+|   |   |       redis.go
+|   |   |       
+|   |   +---handlers
+|   |   |   +---account
+|   |   |   |       login.go
+|   |   |   |       register.go
+|   |   |   |       user.go
+|   |   |   |       
+|   |   |   \---send_email
+|   |   |           email.go
+|   |   |           
+|   |   +---middleware
+|   |   |       middleware.go
+|   |   |       
+|   |   +---models
+|   |   |       message.go
+|   |   |       player.go
+|   |   |       user.go
+|   |   |       
+|   |   \---utils
+|   |           email.go
+|   |           jwt.go
+|   |           
+|   +---gateway
+|   |   \---handlers
+|   |           hub.go
+|   |           websocket.go
+|   |           
+|   +---match
+|   \---proto
+|           game.pb.go
+|           game.proto
+|           
+\---test
+        test_client.go
+        

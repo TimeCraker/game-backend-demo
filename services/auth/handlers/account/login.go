@@ -1,4 +1,4 @@
-package handlers
+package account
 
 import (
 	"log"
@@ -7,11 +7,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
 
-	// 引入你写的 db 包 (Redis操作)
 	"github.com/TimeCraker/game-backend-demo/services/auth/db"
 	"github.com/TimeCraker/game-backend-demo/services/auth/models"
 	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
-	// 移除了 gorm.io/gorm，因为直接使用本包 base.go 里的 DB
 )
 
 // Login 处理用户登录逻辑
@@ -30,7 +28,9 @@ func Login(c *gin.Context) {
 	// 2. 查数据库找用户
 	var user models.User
 	// 【改动点】使用全局变量 DB 替代 mysqlDB
-	if err := DB.Where("username = ?", input.Username).First(&user).Error; err != nil {
+
+	// 替换失效的 DB 为 db.SQLDB
+	if err := db.SQLDB.Where("username = ?", input.Username).First(&user).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
 	}

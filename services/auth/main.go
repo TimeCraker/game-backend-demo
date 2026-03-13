@@ -4,19 +4,18 @@ import (
 	"log"
 
 	"github.com/TimeCraker/game-backend-demo/services/auth/db"
-	"github.com/TimeCraker/game-backend-demo/services/auth/handlers"
+	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/account"
+	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/send_email"
+	"github.com/TimeCraker/game-backend-demo/services/auth/middleware"
+
 	"github.com/gin-gonic/gin"
 )
 
 func main() {
-	// --- 1. 数据库模块初始化 ---
+	// --- 数据库模块初始化 ---
 	db.InitMySQL()
 	db.InitRedis()
-
-	// --- 2. 核心交接：全局变量赋值 ---
-	handlers.DB = db.SQLDB
-
-	// --- 3. 启动 Gin 引擎 ---
+	// --- 启动 Gin 引擎 ---
 	r := gin.Default()
 
 	r.GET("/health", func(c *gin.Context) {
@@ -27,30 +26,34 @@ func main() {
 		})
 	})
 
-	// --- 4. 路由注册 ---
+	// --- 路由注册 ---
 
-	// ===== 新增代码 START =====
 	// 根据你的建议，将基础功能统一放入 v1 组中管理
 	v1 := r.Group("/api/v1")
 	{
 		// 基础账号功能（注册、登录）
-		v1.POST("/register", handlers.Register)
-		v1.POST("/login", handlers.Login)
+
+		// 更新路由绑定，使用新的包名前缀
+		v1.POST("/register", account.Register)
+		v1.POST("/login", account.Login)
 		// 新增：邮箱验证码接口
-		v1.POST("/send-code", handlers.SendEmailCode)
+		v1.POST("/send-code", send_email.SendEmailCode)
+
 	}
-	// ===== 新增代码 END =====
 
 	// 原有的认证组功能
 	api := r.Group("/api")
-	api.Use(handlers.AuthMiddleware())
+
+	// 更新中间件和路由绑定
+	api.Use(middleware.AuthMiddleware())
 	{
 		// 只有带 Token 的请求才能访问 /api/me
-		api.GET("/me", handlers.GetMe)
+		api.GET("/me", account.GetMe)
 	}
 
 	// WebSocket 入口
-	r.GET("/ws", handlers.HandleWS())
+
+	// 更新 WebSocket 路由绑定
 
 	// --- 5. 跑起来！ ---
 	log.Println("👾 游戏认证后端已在 :8081 启动")

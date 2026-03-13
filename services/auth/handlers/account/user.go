@@ -1,10 +1,13 @@
-package handlers
+package account
 
 import (
 	"net/http"
 
 	"github.com/TimeCraker/game-backend-demo/services/auth/models"
 	"github.com/gin-gonic/gin"
+
+	// 引入 db 包以使用 db.SQLDB
+	"github.com/TimeCraker/game-backend-demo/services/auth/db"
 )
 
 // GetMe 获取当前登录玩家的详细信息
@@ -20,7 +23,7 @@ func GetMe(c *gin.Context) {
 	// 2. 查询数据库
 	var user models.User
 	// 【关键】直接使用本包 base.go 中定义的全局变量 DB
-	if err := DB.First(&user, userID).Error; err != nil {
+	if err := db.SQLDB.First(&user, userID).Error; err != nil {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "玩家数据不存在"})
 		return
 	}

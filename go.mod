@@ -1,4 +1,4 @@
-module github.com/TimeCraker/game-backend-demo/services/auth
+module github.com/TimeCraker/game-backend-demo
 
 go 1.25.0
 

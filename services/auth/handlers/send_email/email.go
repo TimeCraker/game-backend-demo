@@ -1,4 +1,4 @@
-package handlers
+package send_email
 
 import (
 	"fmt"

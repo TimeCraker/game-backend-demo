@@ -11,8 +11,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 
-	// 【Protobuf】引入 Protobuf 核心库和生成的协议包
-	pb "github.com/TimeCraker/game-backend-demo/services/auth/proto"
+	// 更新 proto 导入路径，并引入 db 包
+	"github.com/TimeCraker/game-backend-demo/services/auth/db"
+	pb "github.com/TimeCraker/game-backend-demo/services/proto"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -129,7 +130,7 @@ func HandleWS() gin.HandlerFunc {
 // 【Protobuf】同步聊天历史
 func syncChatHistory(conn *websocket.Conn) {
 	var msgs []models.Message
-	DB.Order("id desc").Limit(10).Find(&msgs)
+	db.SQLDB.Order("id desc").Limit(10).Find(&msgs)
 
 	// 将数据库模型转换为 Protobuf 列表
 	var pbHistory []*pb.ChatLog
@@ -163,7 +164,7 @@ func syncWorldState(conn *websocket.Conn, currentUserID uint) {
 		if onlineUserID != currentUserID {
 			var pos models.PlayerPosition
 			// 去数据库里查这个在线玩家的最新坐标
-			if err := DB.Where("user_id = ?", onlineUserID).First(&pos).Error; err == nil {
+			if err := db.SQLDB.Where("user_id = ?", onlineUserID).First(&pos).Error; err == nil {
 				pbPlayers = append(pbPlayers, &pb.PlayerPos{
 					UserId: uint32(pos.UserID),
 					X:      float32(pos.X),
@@ -193,7 +194,7 @@ func handleChatLogic(userID uint, content string) {
 		Sender:  fmt.Sprintf("玩家 %d", userID),
 		Content: content,
 	}
-	DB.Create(&msgRecord)
+	db.SQLDB.Create(&msgRecord)
 
 	// 构造 Protobuf 响应包
 	resp := &pb.GameMessage{
@@ -213,7 +214,7 @@ func handleMoveLogic(userID uint, x, y, z float64) {
 		Y:      y,
 		Z:      z,
 	}
-	DB.Where(models.PlayerPosition{UserID: userID}).Assign(newPos).FirstOrCreate(&models.PlayerPosition{})
+	db.SQLDB.Where(models.PlayerPosition{UserID: userID}).Assign(newPos).FirstOrCreate(&models.PlayerPosition{})
 
 	// 构造二进制广播包
 	moveData := &pb.GameMessage{

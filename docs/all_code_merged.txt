@@ -1,0 +1,1333 @@
+﻿
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\main.go ---
+
+package main
+
+import (
+	"log"
+
+	"github.com/TimeCraker/game-backend-demo/services/auth/db"
+	"github.com/gin-gonic/gin"
+)
+
+func main() {
+	// --- 1. 数据库模块初始化 ---
+	db.InitMySQL()
+	db.InitRedis()
+
+	// --- 2. 核心交接：全局变量赋值 ---
+	handlers.DB = db.SQLDB
+
+	// --- 3. 启动 Gin 引擎 ---
+	r := gin.Default()
+
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"status": "up",
+			"mysql":  "connected",
+			"redis":  "connected",
+		})
+	})
+
+	// --- 4. 路由注册 ---
+
+	// ===== 新增代码 START =====
+	// 根据你的建议，将基础功能统一放入 v1 组中管理
+	v1 := r.Group("/api/v1")
+	{
+		// 基础账号功能（注册、登录）
+		v1.POST("/register", handlers.Register)
+		v1.POST("/login", handlers.Login)
+		// 新增：邮箱验证码接口
+		v1.POST("/send-code", handlers.SendEmailCode)
+	}
+	// ===== 新增代码 END =====
+
+	// 原有的认证组功能
+	api := r.Group("/api")
+	api.Use(handlers.AuthMiddleware())
+	{
+		// 只有带 Token 的请求才能访问 /api/me
+		api.GET("/me", handlers.GetMe)
+	}
+
+	// WebSocket 入口
+	r.GET("/ws", handlers.HandleWS())
+
+	// --- 5. 跑起来！ ---
+	log.Println("👾 游戏认证后端已在 :8081 启动")
+	if err := r.Run(":8081"); err != nil {
+		log.Fatalf("❌ 服务启动失败: %v", err)
+	}
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\db\mysql.go ---
+
+package db
+
+import (
+	"log"
+
+	"github.com/TimeCraker/game-backend-demo/services/auth/models"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+)
+
+// SQLDB 定义为一个包级变量，方便其他地方通过 db.SQLDB 访问
+var SQLDB *gorm.DB
+
+func InitMySQL() {
+	// 这里的 game_dev 是你的数据库名，rootpassword 是你的密码
+	dsn := "root:rootpassword@tcp(localhost:3306)/game_dev?charset=utf8mb4&parseTime=True&loc=Local"
+
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Fatalf("❌ MySQL 连接失败: %v", err)
+	}
+
+	// 自动迁移：把所有的模型都在这里登记
+	err = db.AutoMigrate(&models.User{}, &models.Message{}, &models.PlayerPosition{})
+	if err != nil {
+		log.Fatalf("❌ 数据库自动迁移失败: %v", err)
+	}
+
+	SQLDB = db // 赋值给全局变量
+	log.Println("✅ MySQL 初始化成功，User & Message 表已同步")
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\db\redis.go ---
+
+package db
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// RDB 全局变量，方便在 handlers 里面直接调用
+var RDB *redis.Client
+
+// Go 的 Redis 操作必须带 Context，用于超时控制
+var Ctx = context.Background()
+
+func InitRedis() {
+	// 初始化 Redis 客户端
+	RDB = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379", // 对应 docker-compose 里的映射端口
+		Password: "",               // 默认没设密码
+		DB:       0,                // 使用 0 号数据库
+	})
+
+	// 关键一步：尝试连接并 Ping 一下，确保 Redis 真的活着
+	_, err := RDB.Ping(Ctx).Result()
+	if err != nil {
+		// 如果连不上，直接停掉程序，检查 Docker 是不是没开
+		panic(fmt.Sprintf("Redis 连接失败: %v", err))
+	}
+
+	log.Println("🚀 [Redis] 已就绪，连接成功！")
+}
+
+// 辅助函数：将用户标记为在线
+func SetUserOnline(userID uint) error {
+	key := fmt.Sprintf("online:%d", userID)
+	// 存入 Redis，值设为 "1"，有效期 24 小时
+	return RDB.Set(Ctx, key, "1", 24*time.Hour).Err()
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\handlers\account\login.go ---
+
+package account
+
+import (
+	"log"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
+
+	"github.com/TimeCraker/game-backend-demo/services/auth/db"
+	"github.com/TimeCraker/game-backend-demo/services/auth/models"
+	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
+)
+
+// Login 处理用户登录逻辑
+// 【改动点】去掉了 mysqlDB 参数，现在它直接就是一个标准的 gin Handler
+func Login(c *gin.Context) {
+	// 1. 获取登录参数
+	var input struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
+		return
+	}
+
+	// 2. 查数据库找用户
+	var user models.User
+	// 【改动点】使用全局变量 DB 替代 mysqlDB
+	if err := DB.Where("username = ?", input.Username).First(&user).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
+		return
+	}
+
+	// 3. 验证密码 (Bcrypt 发挥作用的地方)
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
+		return
+	}
+
+	// 4. 生成 JWT Token (颁发 VIP 胸牌)
+	// 🟢 这里会自动调用上面定义的 72 小时逻辑
+	token, err := utils.GenerateToken(int(user.ID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token生成失败"})
+		return
+	}
+
+	// ================== 【核心：Redis 操作】 ==================
+	// 5. 将用户标记为在线
+	err = db.SetUserOnline(user.ID)
+	if err != nil {
+		log.Printf("⚠️ 警告：无法将用户 %d 标记为在线: %v", user.ID, err)
+	} else {
+		log.Printf("👤 玩家 ID:%d 已上线，在线状态已存入 Redis", user.ID)
+	}
+	// ============================================================
+
+	// 6. 返回结果
+	c.JSON(http.StatusOK, gin.H{
+		"message": "登录成功",
+		"token":   token,
+	})
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\handlers\account\register.go ---
+
+package account
+
+import (
+	"net/http"
+
+	"github.com/TimeCraker/game-backend-demo/services/auth/db"
+	"github.com/TimeCraker/game-backend-demo/services/auth/models"
+	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
+)
+
+// RegisterRequest 定义了注册请求的 JSON 格式
+type RegisterRequest struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
+	// 新增邮箱和验证码字段
+	Email string `json:"email" binding:"required,email"`
+	Code  string `json:"code" binding:"required,len=6"`
+}
+
+// Register 处理用户注册逻辑
+func Register(c *gin.Context) {
+	var req RegisterRequest
+
+	// 1. 绑定并校验 JSON 输入
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "参数格式不正确"})
+		return
+	}
+
+	// 1.5 从 Redis 校验验证码 (使用 db.RDB 和 db.Ctx)
+	expectedCode, err := db.RDB.Get(db.Ctx, "register_code:"+req.Email).Result()
+	if err != nil || expectedCode != req.Code {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "验证码错误或已过期"})
+		return
+	}
+	// 验证成功后立即删除，防止单码多次注册
+	db.RDB.Del(db.Ctx, "register_code:"+req.Email)
+
+	// 2. 检查用户名是否已存在
+	var existingUser models.User
+	if err := DB.Where("username = ?", req.Username).First(&existingUser).Error; err == nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "该用户名已被占用"})
+		return
+	}
+
+	// 2.5 检查邮箱是否已被注册
+	if err := DB.Where("email = ?", req.Email).First(&existingUser).Error; err == nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "该邮箱已被注册"})
+		return
+	}
+
+	// 3. 加密密码
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器内部错误"})
+		return
+	}
+
+	// 4. 构造用户模型并存入数据库
+	user := models.User{
+		Username: req.Username,
+		Password: string(hashedPassword),
+		Email:    req.Email,
+	}
+
+	if err := DB.Create(&user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "用户保存失败"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"id":      user.ID,
+		"message": "恭喜！玩家账号创建成功",
+	})
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\handlers\account\user.go ---
+
+package account
+
+import (
+	"net/http"
+
+	"github.com/TimeCraker/game-backend-demo/services/auth/models"
+	"github.com/gin-gonic/gin"
+)
+
+// GetMe 获取当前登录玩家的详细信息
+// 【改动点】移除了 (db *gorm.DB) 参数，直接作为 gin.HandlerFunc 使用
+func GetMe(c *gin.Context) {
+	// 1. 从中间件 Context 中获取 userID (由 AuthMiddleware 解析 Token 后存入)
+	userID, exists := c.Get("userID")
+	if !exists {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "未授权，请先登录"})
+		return
+	}
+
+	// 2. 查询数据库
+	var user models.User
+	// 【关键】直接使用本包 base.go 中定义的全局变量 DB
+	if err := DB.First(&user, userID).Error; err != nil {
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "玩家数据不存在"})
+		return
+	}
+
+	// 3. 返回脱敏后的用户信息
+	c.JSON(http.StatusOK, gin.H{
+		"id":       user.ID,
+		"username": user.Username,
+		"created":  user.CreatedAt,
+	})
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\handlers\send_email\email.go ---
+
+package send_email
+
+import (
+	"fmt"
+	"math/rand"
+	"net/http"
+	"time"
+
+	"github.com/TimeCraker/game-backend-demo/services/auth/db"
+	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
+	"github.com/gin-gonic/gin"
+)
+
+// EmailRequest 接收前端发送验证码的请求
+type EmailRequest struct {
+	Email string `json:"email" binding:"required,email"`
+}
+
+// SendEmailCode 发送验证码接口
+func SendEmailCode(c *gin.Context) {
+	var req EmailRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "邮箱格式不正确"})
+		return
+	}
+
+	email := req.Email
+	today := time.Now().Format("2006-01-02")
+
+	// Redis Key 定义
+	cooldownKey := "email_cooldown:" + email
+	dailyLimitKey := fmt.Sprintf("email_daily_limit:%s:%s", email, today)
+	codeKey := "register_code:" + email
+
+	// ===== 核心逻辑：Redis 限流检查 START =====
+	// 1. 60秒冷却检查
+	if exists, _ := db.RDB.Exists(db.Ctx, cooldownKey).Result(); exists > 0 {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "请稍后再试 (60s 冷却中)"})
+		return
+	}
+
+	// 2. 每日 5 次限制检查
+	dailyCount, _ := db.RDB.Get(db.Ctx, dailyLimitKey).Int()
+	if dailyCount >= 5 {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "该邮箱今日发送次数已达上限"})
+		return
+	}
+	// ===== 限流检查 END =====
+
+	// 3. 生成 6 位验证码
+	rand.Seed(time.Now().UnixNano())
+	code := fmt.Sprintf("%06d", rand.Intn(1000000))
+
+	// 4. 调用真实发送工具
+	if err := utils.SendVerificationEmail(email, code); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "发送失败，请检查配置"})
+		return
+	}
+
+	// 5. 写入 Redis 状态
+	db.RDB.Set(db.Ctx, cooldownKey, "1", 60*time.Second)
+	db.RDB.Incr(db.Ctx, dailyLimitKey)
+	db.RDB.Expire(db.Ctx, dailyLimitKey, 24*time.Hour)
+	db.RDB.Set(db.Ctx, codeKey, code, 5*time.Minute)
+
+	c.JSON(http.StatusOK, gin.H{"message": "验证码已发送至邮箱"})
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\middleware\middleware.go ---
+
+package middleware
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
+	"github.com/gin-gonic/gin"
+)
+
+func AuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Missing token"})
+			return
+		}
+
+		parts := strings.Split(authHeader, " ")
+		if len(parts) != 2 || parts[0] != "Bearer" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token format"})
+			return
+		}
+
+		claims, err := utils.ParseToken(parts[1])
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			return
+		}
+
+		c.Set("userID", claims.UserID)
+		c.Next()
+	}
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\models\message.go ---
+
+package models
+
+import (
+	"time"
+)
+
+// Message 对应数据库中的 messages 表
+type Message struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	Sender    string    `gorm:"size:255;not null" json:"sender"`   // 发送者用户名
+	Content   string    `gorm:"type:text;not null" json:"content"` // 消息内容
+	CreatedAt time.Time `json:"created_at"`                        // 创建时间
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\models\player.go ---
+
+package models
+
+import "gorm.io/gorm"
+
+type PlayerPosition struct {
+	gorm.Model
+	UserID uint    `gorm:"uniqueIndex" json:"user_id"` // 每个玩家唯一的坐标记录
+	X      float64 `json:"x"`                          // 坐标用 float64
+	Y      float64 `json:"y"`
+	Z      float64 `json:"z"`
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\models\user.go ---
+
+package models
+
+import "gorm.io/gorm"
+
+type User struct {
+	gorm.Model
+	Username string `gorm:"uniqueIndex;size:50;not null"`
+	Password string `gorm:"size:255;not null"` // 存储加密后的密码
+	// 新增邮箱字段，设定为唯一索引，确保一个邮箱只能注册一个账号
+	Email string `gorm:"uniqueIndex;size:100;not null"`
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\utils\email.go ---
+
+package utils
+
+import (
+	"crypto/tls"
+	"fmt"
+	"log"
+	"net/smtp"
+)
+
+// 发送邮件的真实配置（请替换为你自己的真实配置）
+const (
+	SMTPHost     = "smtp.qq.com"       // QQ邮箱服务器为例
+	SMTPPort     = "465"               // 一般是 465 或 587
+	SenderEmail  = "2645068655@qq.com" // 你的发件邮箱
+	SenderSecret = "wrwynnhosmzxeaja"  // 你的 SMTP 授权码
+)
+
+// SendVerificationEmail 通过 SMTP 发送具有 UI 排版的 HTML 验证码邮件
+func SendVerificationEmail(toEmail string, code string) error {
+	auth := smtp.PlainAuth("", SenderEmail, SenderSecret, SMTPHost)
+
+	// ===== 邮件内容构建 START =====
+	from := fmt.Sprintf("From: %s\r\n", SenderEmail)
+	to := fmt.Sprintf("To: %s\r\n", toEmail)
+	subject := "Subject: 游戏账号注册验证码\r\n"
+
+	// 修改 Content-Type 为 text/html 确保 UI 正常显示
+	contentType := "Content-Type: text/html; charset=UTF-8\r\n\r\n"
+
+	// 使用 HTML 邮件模板，让验证码邮件具有 UI 排版
+	htmlBody := fmt.Sprintf(`
+<html>
+<body style="margin:0;padding:0;background:#f4f6f8;font-family:Arial,Helvetica,sans-serif;">
+	<div style="width:100%%;padding:40px 0;">
+		<div style="
+			max-width:500px;
+			margin:auto;
+			background:white;
+			border-radius:10px;
+			padding:30px;
+			box-shadow:0 4px 12px rgba(0,0,0,0.1);
+			text-align:center;
+		">
+			<h2 style="color:#333;">欢迎注册 TimeCraker 的游戏！</h2>
+
+			<p style="font-size:16px;color:#666;margin-top:20px;">
+				您的验证码是
+			</p>
+
+			<div style="
+				font-size:36px;
+				font-weight:bold;
+				letter-spacing:6px;
+				color:#2d8cf0;
+				margin:20px 0;
+			">
+				%s
+			</div>
+
+			<p style="font-size:14px;color:#999;">
+				该验证码 <b>5 分钟内有效</b>，请勿将验证码泄露给他人。
+			</p>
+
+			<hr style="margin:30px 0;border:none;border-top:1px solid #eee;">
+
+			<p style="font-size:12px;color:#aaa;">
+				TimeCraker Game System
+			</p>
+		</div>
+	</div>
+</body>
+</html>
+`, code)
+
+	msg := []byte(from + to + subject + contentType + htmlBody)
+	// ===== 邮件内容构建 END =====
+
+	addr := fmt.Sprintf("%s:%s", SMTPHost, SMTPPort)
+
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: false,
+		ServerName:         SMTPHost,
+	}
+
+	conn, err := tls.Dial("tcp", addr, tlsConfig)
+	if err != nil {
+		log.Printf("❌ SMTP TLS 连接失败: %v", err)
+		return err
+	}
+	defer conn.Close()
+
+	client, err := smtp.NewClient(conn, SMTPHost)
+	if err != nil {
+		return err
+	}
+
+	if err = client.Auth(auth); err != nil {
+		log.Printf("❌ SMTP 身份认证失败: %v", err)
+		return err
+	}
+
+	// 1. 设置发件人
+	if err = client.Mail(SenderEmail); err != nil {
+		return err
+	}
+	// 2. 设置收件人
+	if err = client.Rcpt(toEmail); err != nil {
+		return err
+	}
+	// 3. 写入数据流
+	w, err := client.Data()
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(msg)
+	if err != nil {
+		return err
+	}
+	err = w.Close()
+	if err != nil {
+		return err
+	}
+
+	log.Printf("✅ HTML 格式验证码邮件已成功发送至: %s", toEmail)
+	return client.Quit()
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\utils\jwt.go ---
+
+package utils
+
+import (
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+var jwtSecret = []byte("your-secret-key") // 实际应改为环境变量
+
+type Claims struct {
+	// 【修改点】将 uint 改为 int，确保全项目类型统一
+	UserID int `json:"user_id"`
+	jwt.RegisteredClaims
+}
+
+// GenerateToken 生成 JWT token，有效期改为 72 小时
+// 【修改点】参数也改为 int
+func GenerateToken(userID int) (string, error) {
+	claims := Claims{
+		UserID: userID, // 显式指定字段名更清晰
+		RegisteredClaims: jwt.RegisteredClaims{
+			// 🟢 这里从 24 改为 72 小时
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(72 * time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtSecret)
+}
+
+// ParseToken 解析 token，返回 claims
+func ParseToken(tokenString string) (*Claims, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+		return jwtSecret, nil
+	})
+	if err != nil || !token.Valid {
+		return nil, err
+	}
+	claims, ok := token.Claims.(*Claims)
+	if !ok {
+		return nil, jwt.ErrInvalidKey
+	}
+	return claims, nil
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\gateway\handlers\hub.go ---
+
+package handlers
+
+import (
+	"sync"
+
+	"github.com/gorilla/websocket"
+)
+
+// Client 代表一个在线的玩家连接
+type Client struct {
+	UserID int
+	Conn   *websocket.Conn
+}
+
+// Hub 是我们的“大总管”结构体
+type Hub struct {
+	// 存放所有在线连接：key 是用户 ID，value 是对应的连接信息
+	// 使用 sync.Map 是为了保证多线程下读写安全（防止多个人同时登录/下线导致程序崩溃）
+	Clients sync.Map
+}
+
+// GlobalHub 定义一个全局的大总管，方便在任何地方调用
+var GlobalHub = &Hub{}
+
+// Register 玩家上线，登记到名单
+func (h *Hub) Register(userID int, conn *websocket.Conn) {
+	h.Clients.Store(userID, conn)
+}
+
+// Unregister 玩家下线，从名单抹除
+func (h *Hub) Unregister(userID int) {
+	h.Clients.Delete(userID)
+}
+
+// Broadcast 全服广播：给所有人发消息
+func (h *Hub) Broadcast(message []byte) {
+	h.Clients.Range(func(key, value interface{}) bool {
+		conn := value.(*websocket.Conn)
+		// 【关键修改点】将 TextMessage 改为 BinaryMessage
+		// 这样客户端接收到数据后，才会尝试按照 Protobuf 格式解析，而不是解析成字符串
+		_ = conn.WriteMessage(websocket.BinaryMessage, message)
+		return true
+	})
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\gateway\handlers\websocket.go ---
+
+package handlers
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/TimeCraker/game-backend-demo/services/auth/models"
+	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+
+	pb "github.com/TimeCraker/game-backend-demo/services/proto"
+	"google.golang.org/protobuf/proto"
+)
+
+// 心跳配置常量：用于稳定性保障，防止僵尸连接
+const (
+	pingPeriod = 20 * time.Second
+	pongWait   = 60 * time.Second
+)
+
+// Upgrader 负责把普通的 HTTP 请求“升级”成长连接
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+func HandleWS() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// --- 🟢 第一步：身份大检查 (Authentication) ---
+		tokenString := c.Query("token")
+		if tokenString == "" {
+			log.Println("❌ 拒绝连接：缺少 Token")
+			return
+		}
+
+		claims, err := utils.ParseToken(tokenString)
+		if err != nil {
+			log.Printf("❌ 拒绝连接：Token 无效: %v", err)
+			return
+		}
+
+		userID := uint(claims.UserID)
+
+		// --- 🟡 第二步：协议升级 (Upgrade) ---
+		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+		if err != nil {
+			log.Printf("❌ 协议升级失败: %v", err)
+			return
+		}
+
+		// --- 🔵 第三步：连接管理 (Management) ---
+		GlobalHub.Register(int(userID), conn)
+
+		// 同步最近 10 条聊天记录（聊天回溯）
+		syncChatHistory(conn)
+
+		// 同步当前在线的所有玩家位置给这个刚进入的玩家（功能 A）
+		syncWorldState(conn, userID)
+
+		// 稳定性保障：配置心跳感应与读取限制
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().Add(pongWait))
+			return nil
+		})
+
+		// 启动心跳协程
+		go func(conn *websocket.Conn) {
+			ticker := time.NewTicker(pingPeriod)
+			defer ticker.Stop()
+			for range ticker.C {
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			}
+		}(conn)
+
+		// 2. 离场清理
+		defer func() {
+			GlobalHub.Unregister(int(userID))
+			conn.Close()
+
+			// 【更新功能：Protobuf】使用二进制格式广播下线
+			leaveMsg := &pb.GameMessage{
+				Type:   "logout",
+				UserId: uint32(userID),
+			}
+			payload, _ := proto.Marshal(leaveMsg)
+			GlobalHub.Broadcast(payload)
+
+			log.Printf("👤 玩家 %d 的连接已释放，已广播离开消息并清理资源", userID)
+		}()
+
+		log.Printf("🔌 玩家 ID:%d 已成功进入游戏大厅，[Protobuf 模式启动]", userID)
+
+		// --- 🟠 第四步：消息传送阵 (Message Loop) ---
+		for {
+			_, p, err := conn.ReadMessage()
+			if err != nil {
+				log.Printf("⚠️ 玩家 %d 掉线或连接超时", userID)
+				break
+			}
+
+			// --- 【Protobuf】解析二进制指令 ---
+			incoming := &pb.GameMessage{}
+			if err := proto.Unmarshal(p, incoming); err != nil {
+				log.Printf("⚠️ 收到损坏的二进制包: %v", err)
+				continue
+			}
+
+			// 根据消息类型进行分流处理
+			switch incoming.Type {
+			case "chat":
+				handleChatLogic(userID, incoming.Content)
+			case "move":
+				handleMoveLogic(userID, float64(incoming.X), float64(incoming.Y), float64(incoming.Z))
+			default:
+				log.Printf("❓ 未知二进制指令类型: %s", incoming.Type)
+			}
+		}
+	}
+}
+
+// 【Protobuf】同步聊天历史
+func syncChatHistory(conn *websocket.Conn) {
+	var msgs []models.Message
+	DB.Order("id desc").Limit(10).Find(&msgs)
+
+	// 将数据库模型转换为 Protobuf 列表
+	var pbHistory []*pb.ChatLog
+	for _, m := range msgs {
+		pbHistory = append(pbHistory, &pb.ChatLog{
+			Sender:  m.Sender,
+			Content: m.Content,
+		})
+	}
+
+	data := &pb.GameMessage{
+		Type:    "chat_history",
+		History: pbHistory,
+	}
+
+	payload, _ := proto.Marshal(data)
+	// 【更新】使用 BinaryMessage 发送二进制流
+	_ = conn.WriteMessage(websocket.BinaryMessage, payload)
+}
+
+// 【更新功能：Protobuf】同步世界位置快照
+// 【修复Bug】修改查询逻辑，现在只同步当前 GlobalHub 中实际在线的玩家，过滤掉已下线的“幽灵”
+func syncWorldState(conn *websocket.Conn, currentUserID uint) {
+	var pbPlayers []*pb.PlayerPos
+
+	// 遍历大总管名单，只找当前在线的玩家
+	GlobalHub.Clients.Range(func(key, value interface{}) bool {
+		onlineUserID := uint(key.(int))
+
+		// 排除掉自己，只同步别人的位置
+		if onlineUserID != currentUserID {
+			var pos models.PlayerPosition
+			// 去数据库里查这个在线玩家的最新坐标
+			if err := DB.Where("user_id = ?", onlineUserID).First(&pos).Error; err == nil {
+				pbPlayers = append(pbPlayers, &pb.PlayerPos{
+					UserId: uint32(pos.UserID),
+					X:      float32(pos.X),
+					Y:      float32(pos.Y),
+					Z:      float32(pos.Z),
+				})
+			}
+		}
+		return true
+	})
+
+	// 只有当存在其他在线玩家时，才发送初始化包
+	if len(pbPlayers) > 0 {
+		data := &pb.GameMessage{
+			Type:    "init_players",
+			Players: pbPlayers,
+		}
+
+		payload, _ := proto.Marshal(data)
+		_ = conn.WriteMessage(websocket.BinaryMessage, payload)
+	}
+}
+
+// 【Protobuf】处理聊天业务
+func handleChatLogic(userID uint, content string) {
+	msgRecord := models.Message{
+		Sender:  fmt.Sprintf("玩家 %d", userID),
+		Content: content,
+	}
+	DB.Create(&msgRecord)
+
+	// 构造 Protobuf 响应包
+	resp := &pb.GameMessage{
+		Type:    "chat",
+		Content: content,
+		UserId:  uint32(userID),
+	}
+	payload, _ := proto.Marshal(resp)
+	GlobalHub.Broadcast(payload)
+}
+
+// 【Protobuf】处理玩家移动业务
+func handleMoveLogic(userID uint, x, y, z float64) {
+	newPos := models.PlayerPosition{
+		UserID: userID,
+		X:      x,
+		Y:      y,
+		Z:      z,
+	}
+	DB.Where(models.PlayerPosition{UserID: userID}).Assign(newPos).FirstOrCreate(&models.PlayerPosition{})
+
+	// 构造二进制广播包
+	moveData := &pb.GameMessage{
+		Type:   "move",
+		UserId: uint32(userID),
+		X:      float32(x),
+		Y:      float32(y),
+		Z:      float32(z),
+	}
+	payload, _ := proto.Marshal(moveData)
+	GlobalHub.Broadcast(payload)
+
+	// 保留测试用注释：
+	// log.Printf("🏃 玩家 %d 移动至 (%.2f, %.2f, %.2f)", userID, x, y, z)
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\proto\game.pb.go ---
+
+// Code generated by protoc-gen-go. DO NOT EDIT.
+// versions:
+// 	protoc-gen-go v1.36.11
+// 	protoc        v7.34.0
+// source: game.proto
+
+// 生成的 Go 代码所在的包名
+
+package proto
+
+import (
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
+)
+
+const (
+	// Verify that this generated code is sufficiently up-to-date.
+	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
+	// Verify that runtime/protoimpl is sufficiently up-to-date.
+	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
+)
+
+// 定义统一的消息包（替代之前的 GameMessage JSON）
+type GameMessage struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Type    string                 `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`                    // 消息类型: chat, move, init, leave
+	UserId  uint32                 `protobuf:"varint,2,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"` // 玩家 ID
+	Content string                 `protobuf:"bytes,3,opt,name=content,proto3" json:"content,omitempty"`              // 聊天内容
+	X       float32                `protobuf:"fixed32,4,opt,name=x,proto3" json:"x,omitempty"`                        // 坐标 X
+	Y       float32                `protobuf:"fixed32,5,opt,name=y,proto3" json:"y,omitempty"`                        // 坐标 Y
+	Z       float32                `protobuf:"fixed32,6,opt,name=z,proto3" json:"z,omitempty"`                        // 坐标 Z
+	// 列表类型：用于同步历史记录或玩家列表
+	Players       []*PlayerPos `protobuf:"bytes,7,rep,name=players,proto3" json:"players,omitempty"`
+	History       []*ChatLog   `protobuf:"bytes,8,rep,name=history,proto3" json:"history,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GameMessage) Reset() {
+	*x = GameMessage{}
+	mi := &file_game_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GameMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GameMessage) ProtoMessage() {}
+
+func (x *GameMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_game_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GameMessage.ProtoReflect.Descriptor instead.
+func (*GameMessage) Descriptor() ([]byte, []int) {
+	return file_game_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *GameMessage) GetType() string {
+	if x != nil {
+		return x.Type
+	}
+	return ""
+}
+
+func (x *GameMessage) GetUserId() uint32 {
+	if x != nil {
+		return x.UserId
+	}
+	return 0
+}
+
+func (x *GameMessage) GetContent() string {
+	if x != nil {
+		return x.Content
+	}
+	return ""
+}
+
+func (x *GameMessage) GetX() float32 {
+	if x != nil {
+		return x.X
+	}
+	return 0
+}
+
+func (x *GameMessage) GetY() float32 {
+	if x != nil {
+		return x.Y
+	}
+	return 0
+}
+
+func (x *GameMessage) GetZ() float32 {
+	if x != nil {
+		return x.Z
+	}
+	return 0
+}
+
+func (x *GameMessage) GetPlayers() []*PlayerPos {
+	if x != nil {
+		return x.Players
+	}
+	return nil
+}
+
+func (x *GameMessage) GetHistory() []*ChatLog {
+	if x != nil {
+		return x.History
+	}
+	return nil
+}
+
+type PlayerPos struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	UserId        uint32                 `protobuf:"varint,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	X             float32                `protobuf:"fixed32,2,opt,name=x,proto3" json:"x,omitempty"`
+	Y             float32                `protobuf:"fixed32,3,opt,name=y,proto3" json:"y,omitempty"`
+	Z             float32                `protobuf:"fixed32,4,opt,name=z,proto3" json:"z,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PlayerPos) Reset() {
+	*x = PlayerPos{}
+	mi := &file_game_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PlayerPos) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PlayerPos) ProtoMessage() {}
+
+func (x *PlayerPos) ProtoReflect() protoreflect.Message {
+	mi := &file_game_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PlayerPos.ProtoReflect.Descriptor instead.
+func (*PlayerPos) Descriptor() ([]byte, []int) {
+	return file_game_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *PlayerPos) GetUserId() uint32 {
+	if x != nil {
+		return x.UserId
+	}
+	return 0
+}
+
+func (x *PlayerPos) GetX() float32 {
+	if x != nil {
+		return x.X
+	}
+	return 0
+}
+
+func (x *PlayerPos) GetY() float32 {
+	if x != nil {
+		return x.Y
+	}
+	return 0
+}
+
+func (x *PlayerPos) GetZ() float32 {
+	if x != nil {
+		return x.Z
+	}
+	return 0
+}
+
+type ChatLog struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Sender        string                 `protobuf:"bytes,1,opt,name=sender,proto3" json:"sender,omitempty"`
+	Content       string                 `protobuf:"bytes,2,opt,name=content,proto3" json:"content,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ChatLog) Reset() {
+	*x = ChatLog{}
+	mi := &file_game_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ChatLog) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ChatLog) ProtoMessage() {}
+
+func (x *ChatLog) ProtoReflect() protoreflect.Message {
+	mi := &file_game_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ChatLog.ProtoReflect.Descriptor instead.
+func (*ChatLog) Descriptor() ([]byte, []int) {
+	return file_game_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *ChatLog) GetSender() string {
+	if x != nil {
+		return x.Sender
+	}
+	return ""
+}
+
+func (x *ChatLog) GetContent() string {
+	if x != nil {
+		return x.Content
+	}
+	return ""
+}
+
+var File_game_proto protoreflect.FileDescriptor
+
+const file_game_proto_rawDesc = "" +
+	"\n" +
+	"\n" +
+	"game.proto\x12\x05proto\"\xd4\x01\n" +
+	"\vGameMessage\x12\x12\n" +
+	"\x04type\x18\x01 \x01(\tR\x04type\x12\x17\n" +
+	"\auser_id\x18\x02 \x01(\rR\x06userId\x12\x18\n" +
+	"\acontent\x18\x03 \x01(\tR\acontent\x12\f\n" +
+	"\x01x\x18\x04 \x01(\x02R\x01x\x12\f\n" +
+	"\x01y\x18\x05 \x01(\x02R\x01y\x12\f\n" +
+	"\x01z\x18\x06 \x01(\x02R\x01z\x12*\n" +
+	"\aplayers\x18\a \x03(\v2\x10.proto.PlayerPosR\aplayers\x12(\n" +
+	"\ahistory\x18\b \x03(\v2\x0e.proto.ChatLogR\ahistory\"N\n" +
+	"\tPlayerPos\x12\x17\n" +
+	"\auser_id\x18\x01 \x01(\rR\x06userId\x12\f\n" +
+	"\x01x\x18\x02 \x01(\x02R\x01x\x12\f\n" +
+	"\x01y\x18\x03 \x01(\x02R\x01y\x12\f\n" +
+	"\x01z\x18\x04 \x01(\x02R\x01z\";\n" +
+	"\aChatLog\x12\x16\n" +
+	"\x06sender\x18\x01 \x01(\tR\x06sender\x12\x18\n" +
+	"\acontent\x18\x02 \x01(\tR\acontentB\tZ\a./protob\x06proto3"
+
+var (
+	file_game_proto_rawDescOnce sync.Once
+	file_game_proto_rawDescData []byte
+)
+
+func file_game_proto_rawDescGZIP() []byte {
+	file_game_proto_rawDescOnce.Do(func() {
+		file_game_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_game_proto_rawDesc), len(file_game_proto_rawDesc)))
+	})
+	return file_game_proto_rawDescData
+}
+
+var file_game_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_game_proto_goTypes = []any{
+	(*GameMessage)(nil), // 0: proto.GameMessage
+	(*PlayerPos)(nil),   // 1: proto.PlayerPos
+	(*ChatLog)(nil),     // 2: proto.ChatLog
+}
+var file_game_proto_depIdxs = []int32{
+	1, // 0: proto.GameMessage.players:type_name -> proto.PlayerPos
+	2, // 1: proto.GameMessage.history:type_name -> proto.ChatLog
+	2, // [2:2] is the sub-list for method output_type
+	2, // [2:2] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
+}
+
+func init() { file_game_proto_init() }
+func file_game_proto_init() {
+	if File_game_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_game_proto_rawDesc), len(file_game_proto_rawDesc)),
+			NumEnums:      0,
+			NumMessages:   3,
+			NumExtensions: 0,
+			NumServices:   0,
+		},
+		GoTypes:           file_game_proto_goTypes,
+		DependencyIndexes: file_game_proto_depIdxs,
+		MessageInfos:      file_game_proto_msgTypes,
+	}.Build()
+	File_game_proto = out.File
+	file_game_proto_goTypes = nil
+	file_game_proto_depIdxs = nil
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\test\test_client.go ---
+
+package main
+
+import (
+	"log"
+	"net/url"
+
+	// 使用 pb 作为你生成的协议代码的别名
+	pb "github.com/TimeCraker/game-backend-demo/services/auth/proto"
+	"github.com/gorilla/websocket"
+
+	// 引用 Google 官方库进行二进制转换
+	"google.golang.org/protobuf/proto"
+)
+
+func main() {
+	// ❗请在这里替换为你登录成功的 Token
+	token := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxLCJleHAiOjE3NzI2MDg4ODEsImlhdCI6MTc3MjUyMjQ4MX0.fSHCspqvRCNXSHX3CKeeZsa7YVUJHtfyR3tCi73UyR0"
+	u := url.URL{Scheme: "ws", Host: "localhost:8081", Path: "/ws", RawQuery: "token=" + token}
+
+	log.Printf("🚀 正在建立长连接: %s", u.String())
+
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		log.Fatalf("❌ 连接失败: %v", err)
+	}
+	defer c.Close()
+
+	// 1. 发送一个移动包测试
+	moveMsg := &pb.GameMessage{
+		Type:   "move",
+		UserId: 1, // 模拟玩家 1
+		X:      10.5,
+		Y:      0,
+		Z:      -5.2,
+	}
+
+	data, err := proto.Marshal(moveMsg)
+	if err != nil {
+		log.Fatalf("❌ 序列化失败: %v", err)
+	}
+
+	if err := c.WriteMessage(websocket.BinaryMessage, data); err != nil {
+		log.Fatalf("❌ 发送失败: %v", err)
+	}
+	log.Println("✅ 已发送二进制移动包")
+
+	// 2. 持续接收服务器的回传（聊天历史、位置初始化等）
+	// 替换 test_client.go 最后的 for 循环部分
+	for {
+		_, message, err := c.ReadMessage()
+		if err != nil {
+			log.Printf("⚠️ 停止读取: %v", err)
+			return
+		}
+
+		resp := &pb.GameMessage{}
+		proto.Unmarshal(message, resp)
+
+		switch resp.Type {
+		case "chat_history":
+			log.Printf("📩 [历史记录] 收到 %d 条消息", len(resp.History))
+			for _, h := range resp.History {
+				log.Printf("   - %s: %s", h.Sender, h.Content)
+			}
+		case "init_players":
+			log.Printf("📩 [初始位置] 收到 %d 个玩家坐标", len(resp.Players))
+		case "move":
+			log.Printf("📩 [玩家移动] ID:%d -> 坐标: (%.1f, %.1f, %.1f)", resp.UserId, resp.X, resp.Y, resp.Z)
+		case "chat":
+			log.Printf("📩 [新聊天] 玩家 %d 说: %s", resp.UserId, resp.Content)
+		}
+	}
+}

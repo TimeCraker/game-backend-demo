@@ -1,10 +1,9 @@
-package handlers
+package account
 
 import (
 	"net/http"
 
 	"github.com/TimeCraker/game-backend-demo/services/auth/db"
-
 	"github.com/TimeCraker/game-backend-demo/services/auth/models"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -40,13 +39,14 @@ func Register(c *gin.Context) {
 
 	// 2. 检查用户名是否已存在
 	var existingUser models.User
-	if err := DB.Where("username = ?", req.Username).First(&existingUser).Error; err == nil {
+	// 替换失效的 DB 为 db.SQLDB
+	if err := db.SQLDB.Where("username = ?", req.Username).First(&existingUser).Error; err == nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "该用户名已被占用"})
 		return
 	}
 
 	// 2.5 检查邮箱是否已被注册
-	if err := DB.Where("email = ?", req.Email).First(&existingUser).Error; err == nil {
+	if err := db.SQLDB.Where("email = ?", req.Email).First(&existingUser).Error; err == nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "该邮箱已被注册"})
 		return
 	}
@@ -65,7 +65,8 @@ func Register(c *gin.Context) {
 		Email:    req.Email,
 	}
 
-	if err := DB.Create(&user).Error; err != nil {
+	// 替换失效的 DB 为 db.SQLDB
+	if err := db.SQLDB.Create(&user).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "用户保存失败"})
 		return
 	}
