@@ -1,5 +1,7 @@
 ﻿
---- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\main.go ---
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\main.go ---
+
+// --- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\main.go ---
 
 package main
 
@@ -7,18 +9,21 @@ import (
 	"log"
 
 	"github.com/TimeCraker/game-backend-demo/services/auth/db"
+	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/account"
+	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/send_email"
+	"github.com/TimeCraker/game-backend-demo/services/auth/middleware"
+
+	// [引入 gateway 服务的 handlers 包，使用 gw_handlers 别名]
+	gw_handlers "github.com/TimeCraker/game-backend-demo/services/gateway/handlers"
+
 	"github.com/gin-gonic/gin"
 )
 
 func main() {
-	// --- 1. 数据库模块初始化 ---
+	// --- 数据库模块初始化 ---
 	db.InitMySQL()
 	db.InitRedis()
-
-	// --- 2. 核心交接：全局变量赋值 ---
-	handlers.DB = db.SQLDB
-
-	// --- 3. 启动 Gin 引擎 ---
+	// --- 启动 Gin 引擎 ---
 	r := gin.Default()
 
 	r.GET("/health", func(c *gin.Context) {
@@ -29,30 +34,31 @@ func main() {
 		})
 	})
 
-	// --- 4. 路由注册 ---
-
-	// ===== 新增代码 START =====
-	// 根据你的建议，将基础功能统一放入 v1 组中管理
+	// --- 路由注册 ---
+	// 将基础功能统一放入 v1 组中管理
 	v1 := r.Group("/api/v1")
 	{
 		// 基础账号功能（注册、登录）
-		v1.POST("/register", handlers.Register)
-		v1.POST("/login", handlers.Login)
+		v1.POST("/register", account.Register)
+		v1.POST("/login", account.Login)
 		// 新增：邮箱验证码接口
-		v1.POST("/send-code", handlers.SendEmailCode)
+		v1.POST("/send-code", send_email.SendEmailCode)
+
 	}
-	// ===== 新增代码 END =====
 
 	// 原有的认证组功能
 	api := r.Group("/api")
-	api.Use(handlers.AuthMiddleware())
+
+	// 更新中间件和路由绑定
+	api.Use(middleware.AuthMiddleware())
 	{
 		// 只有带 Token 的请求才能访问 /api/me
-		api.GET("/me", handlers.GetMe)
+		api.GET("/me", account.GetMe)
 	}
 
 	// WebSocket 入口
-	r.GET("/ws", handlers.HandleWS())
+	// 更新 WebSocket 路由绑定
+	r.GET("/ws", gw_handlers.HandleWS())
 
 	// --- 5. 跑起来！ ---
 	log.Println("👾 游戏认证后端已在 :8081 启动")
@@ -171,7 +177,9 @@ func Login(c *gin.Context) {
 	// 2. 查数据库找用户
 	var user models.User
 	// 【改动点】使用全局变量 DB 替代 mysqlDB
-	if err := DB.Where("username = ?", input.Username).First(&user).Error; err != nil {
+
+	// 替换失效的 DB 为 db.SQLDB
+	if err := db.SQLDB.Where("username = ?", input.Username).First(&user).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
 	}
@@ -250,13 +258,14 @@ func Register(c *gin.Context) {
 
 	// 2. 检查用户名是否已存在
 	var existingUser models.User
-	if err := DB.Where("username = ?", req.Username).First(&existingUser).Error; err == nil {
+	// 替换失效的 DB 为 db.SQLDB
+	if err := db.SQLDB.Where("username = ?", req.Username).First(&existingUser).Error; err == nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "该用户名已被占用"})
 		return
 	}
 
 	// 2.5 检查邮箱是否已被注册
-	if err := DB.Where("email = ?", req.Email).First(&existingUser).Error; err == nil {
+	if err := db.SQLDB.Where("email = ?", req.Email).First(&existingUser).Error; err == nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "该邮箱已被注册"})
 		return
 	}
@@ -275,7 +284,8 @@ func Register(c *gin.Context) {
 		Email:    req.Email,
 	}
 
-	if err := DB.Create(&user).Error; err != nil {
+	// 替换失效的 DB 为 db.SQLDB
+	if err := db.SQLDB.Create(&user).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "用户保存失败"})
 		return
 	}
@@ -295,6 +305,9 @@ import (
 
 	"github.com/TimeCraker/game-backend-demo/services/auth/models"
 	"github.com/gin-gonic/gin"
+
+	// 引入 db 包以使用 db.SQLDB
+	"github.com/TimeCraker/game-backend-demo/services/auth/db"
 )
 
 // GetMe 获取当前登录玩家的详细信息
@@ -310,7 +323,7 @@ func GetMe(c *gin.Context) {
 	// 2. 查询数据库
 	var user models.User
 	// 【关键】直接使用本包 base.go 中定义的全局变量 DB
-	if err := DB.First(&user, userID).Error; err != nil {
+	if err := db.SQLDB.First(&user, userID).Error; err != nil {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "玩家数据不存在"})
 		return
 	}
@@ -713,6 +726,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 
+	// 更新 proto 导入路径，并引入 db 包
+	"github.com/TimeCraker/game-backend-demo/services/auth/db"
 	pb "github.com/TimeCraker/game-backend-demo/services/proto"
 	"google.golang.org/protobuf/proto"
 )
@@ -830,7 +845,7 @@ func HandleWS() gin.HandlerFunc {
 // 【Protobuf】同步聊天历史
 func syncChatHistory(conn *websocket.Conn) {
 	var msgs []models.Message
-	DB.Order("id desc").Limit(10).Find(&msgs)
+	db.SQLDB.Order("id desc").Limit(10).Find(&msgs)
 
 	// 将数据库模型转换为 Protobuf 列表
 	var pbHistory []*pb.ChatLog
@@ -864,7 +879,7 @@ func syncWorldState(conn *websocket.Conn, currentUserID uint) {
 		if onlineUserID != currentUserID {
 			var pos models.PlayerPosition
 			// 去数据库里查这个在线玩家的最新坐标
-			if err := DB.Where("user_id = ?", onlineUserID).First(&pos).Error; err == nil {
+			if err := db.SQLDB.Where("user_id = ?", onlineUserID).First(&pos).Error; err == nil {
 				pbPlayers = append(pbPlayers, &pb.PlayerPos{
 					UserId: uint32(pos.UserID),
 					X:      float32(pos.X),
@@ -894,7 +909,7 @@ func handleChatLogic(userID uint, content string) {
 		Sender:  fmt.Sprintf("玩家 %d", userID),
 		Content: content,
 	}
-	DB.Create(&msgRecord)
+	db.SQLDB.Create(&msgRecord)
 
 	// 构造 Protobuf 响应包
 	resp := &pb.GameMessage{
@@ -914,7 +929,7 @@ func handleMoveLogic(userID uint, x, y, z float64) {
 		Y:      y,
 		Z:      z,
 	}
-	DB.Where(models.PlayerPosition{UserID: userID}).Assign(newPos).FirstOrCreate(&models.PlayerPosition{})
+	db.SQLDB.Where(models.PlayerPosition{UserID: userID}).Assign(newPos).FirstOrCreate(&models.PlayerPosition{})
 
 	// 构造二进制广播包
 	moveData := &pb.GameMessage{
@@ -1264,8 +1279,8 @@ import (
 	"log"
 	"net/url"
 
-	// 使用 pb 作为你生成的协议代码的别名
-	pb "github.com/TimeCraker/game-backend-demo/services/auth/proto"
+	// 更新 proto 导入路径
+	pb "github.com/TimeCraker/game-backend-demo/services/proto"
 	"github.com/gorilla/websocket"
 
 	// 引用 Google 官方库进行二进制转换

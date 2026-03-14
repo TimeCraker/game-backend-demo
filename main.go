@@ -1,3 +1,5 @@
+// --- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\main.go ---
+
 package main
 
 import (
@@ -7,6 +9,9 @@ import (
 	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/account"
 	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/send_email"
 	"github.com/TimeCraker/game-backend-demo/services/auth/middleware"
+
+	// [引入 gateway 服务的 handlers 包，使用 gw_handlers 别名]
+	gw_handlers "github.com/TimeCraker/game-backend-demo/services/gateway/handlers"
 
 	"github.com/gin-gonic/gin"
 )
@@ -27,13 +32,10 @@ func main() {
 	})
 
 	// --- 路由注册 ---
-
-	// 根据你的建议，将基础功能统一放入 v1 组中管理
+	// 将基础功能统一放入 v1 组中管理
 	v1 := r.Group("/api/v1")
 	{
 		// 基础账号功能（注册、登录）
-
-		// 更新路由绑定，使用新的包名前缀
 		v1.POST("/register", account.Register)
 		v1.POST("/login", account.Login)
 		// 新增：邮箱验证码接口
@@ -52,8 +54,8 @@ func main() {
 	}
 
 	// WebSocket 入口
-
 	// 更新 WebSocket 路由绑定
+	r.GET("/ws", gw_handlers.HandleWS())
 
 	// --- 5. 跑起来！ ---
 	log.Println("👾 游戏认证后端已在 :8081 启动")

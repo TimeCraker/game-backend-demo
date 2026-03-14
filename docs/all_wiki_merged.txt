@@ -1,147 +1,4 @@
 ﻿
---- WIKI PAGE: README.md ---
-
-# 3D Game Backend (Go + Unity Mirror)
-
-这是一个为 Unity Mirror 插件设计的轻量级、高性能分布式游戏后端。采用 Go 语言构建，支持万级玩家并发状态同步。
-
-## 🚀 技术架构
-- **Gin**: RESTful API 路由处理。
-- **GORM**: 玩家数据、位置信息、聊天记录持久化。
-- **Redis**: 毫秒级在线状态感知与分布式会话管理。
-- **WebSocket**: 基于事件分流的消息分发系统（支持 JSON/Protobuf）。
-
-## 📁 目录说明
-- `services/auth`: 核心业务逻辑（注册、登录、同步、网关）。
-- `models/`: GORM 模型定义。
-- `handlers/`: 业务分流器，包含全局 `GlobalHub` 管理。
-- `utils/`: JWT 工具与响应包装。
-
-## 🛠️ 快速启动
-1. 启动环境：`docker-compose up -d`
-2. 运行后端：`cd services/auth && go run main.go`
-3. 接口地址：`http://localhost:8080` | `ws://localhost:8080/ws?token=xxx`
-
---- WIKI PAGE: roadmap.md ---
-
-📅 游戏后端 Demo 逐日通关计划（1.0版）
-第一阶段：账号与基建（Week 1）
-这一阶段的目标是：让玩家能注册、登录，且服务器知道“谁在线”。
-
-Day 1：环境闭环（已完成 ✅）
-
-安装 Go, WSL2, Docker。
-
-配置 docker-compose.yml (MySQL, Redis)。
-
-初始化 go mod，建立 services/auth 基础目录。
-
-Day 2：持久化注册（已完成 ✅）
-
-引入 GORM，定义 User 模型。
-
-实现 POST /register：使用 bcrypt 哈希加密存储密码。
-
-实现 POST /login：比对密码并下发 JWT Token。
-
-Day 3：状态感知（今日任务 🚀）
-
-步骤1：编写 internal/common/db/redis.go 初始化连接池。
-
-步骤2：登录成功后，将 user_id 存入 Redis（Key: online_users:{id}, Value: token），设置 24h 过期。
-
-步骤3：实现 GET /api/status/:id 接口，直接查 Redis 返回该用户是否在线。
-
-Day 4：鉴权中间件与用户画像
-
-完善 AuthMiddleware：从 Header 取出 Bearer <token> 并解析。
-
-实现 GET /api/me：通过 Token 解析出的 UID，去数据库查出昵称、等级。
-
-Day 5：代码整改与日志
-
-引入 zap 或 logrus 日志库（别再满屏 fmt.Println 了，面试官不喜欢）。
-
-统一 API 返回格式：{"code": 200, "data": {}, "msg": ""}。
-
-第二阶段：长连接网关（Week 2）
-这一阶段的目标是：建立那个“打不断”的 WebSocket 通道。
-
-Day 6：WebSocket 握手
-
-在 services/gateway 下新建服务。
-
-实现 /ws 接口，将 HTTP 协议升级（Upgrade）为 WebSocket。
-
-Day 7：连接池管理 (Manager)
-
-编写 Client 和 ClientManager 结构体。
-
-使用 sync.Map 存储当前所有活跃的 WebSocket 连接。
-
-Day 8：心跳机制（保活）
-
-服务端逻辑：每隔 5 秒向客户端发一个 Ping。
-
-清理逻辑：如果客户端 15 秒没回 Pong，强制断开连接并清理 Redis 在线状态。
-
-Day 9：ProtoBuf 协议引入
-
-安装 protoc 编译器。
-
-定义第一个协议文件 message.proto（包含消息 ID 和 Data 字段）。
-
-用二进制传输代替 JSON，这是游戏后端的门面。
-
-Day 10：网关路由转发
-
-网关收到消息后，根据消息 ID 判断该发给哪个业务模块。
-
-第三阶段：房间与同步（Week 3-4）
-这一阶段的目标是：让 A 的移动，能在 B 的屏幕上显示出来。
-
-Day 11-12：房间管理逻辑
-
-实现 CreateRoom 和 JoinRoom。
-
-一个房间对应一个 Goroutine（轻量级线程），负责处理房间内消息。
-
-Day 13-14：服务端权威同步（重点！）
-
-实现 Tick Loop（每秒 20 次循环）。
-
-服务器每 50ms 广播一次房间内所有人的位置快照。
-
-Day 15-20：Unity 客户端接入
-
-在 Unity 中编写 C# 代码连接 WebSocket。
-
-实现最基础的“方块移动同步”。
-
-
-# 📅 游戏后端开发里程碑（2.0 优化版）
-
-## 第一阶段：基建与账号 (Completed ✅)
-- [x] Day 1-2: 环境搭建、MySQL/Redis 容器化、Bcrypt 注册登录。
-- [x] Day 3: Redis 状态感知逻辑、在线/离线自动切换。
-- [x] Day 4: JWT 鉴权中间件、玩家画像接口获取。
-- [x] Day 5: 响应格式规范化、初步日志管理。
-
-## 第二阶段：实时同步与性能优化 (Ongoing 🚀)
-- [x] Day 6-7: WebSocket 握手协议、基于 JSON 的消息分流路由。
-- [x] Day 8: 玩家坐标持久化、全服位置广播实现。
-- [ ] **Next - Day 9: 稳定性保障**
-    - 实现 WS 心跳检测（Ping/Pong 机制）。
-    - 僵尸连接自动剔除逻辑。
-- [ ] **Day 10: 协议进化**
-    - 引入 Protobuf 替代 JSON，降低 60% 以上的网络带宽消耗。
-    - 定义 `message.proto` 统一消息格式。
-
-## 第三阶段：房间系统与 Unity 联调 (Upcoming 🕒)
-- [ ] Day 11-13: 房间逻辑设计（Group 广播取代全服广播）。
-- [ ] Day 14-15: 场景快照同步（AOI 算法初探，只给视野内的玩家发同步包）。
-- [ ] Day 16-20: Unity 客户端接入，实现方块人流畅同步。
-
 --- WIKI PAGE: #-📆-2026.03.03.02-下午开发笔记-A.md ---
 
 ---
@@ -358,6 +215,65 @@ feat: restructure routing to v1 and introduce email verification
 - 玩家加入场景时只能看到真正在线的人，世界状态准确。
 - 注册流程已完善，支持邮箱验证码验证，符合生产级应用规范。
 - 后端接口结构清晰，认证与业务路由分离，为后续功能扩展打下基础。
+
+--- WIKI PAGE: #-📆-2026.03.13-上午开发笔记：项目架构重构与工程规范化.md ---
+
+# 📆 2026.03.13 上午开发笔记：项目架构重构与工程规范化
+
+## ✅ 重构内容概览
+
+本次重构以微服务化和工程规范化为目标，对项目布局进行了系统性调整，主要涉及以下五个方面：
+
+1. **统一模块管理**  
+   - 将 `go.mod` 从子目录移至**项目根目录**，建立单一 Module 结构，使 `auth`、`gateway` 等服务能互相引用代码，无需发包到云端。
+
+2. **按业务域拆分 handlers**  
+   - 将原先庞大的 `handlers` 文件夹按业务域拆分为独立子包：`account`、`send_email` 等，为后续添加商城、背包等功能提供清晰扩展路径。
+
+3. **抽离长连接服务**  
+   - 将 WebSocket 和 Hub 相关逻辑迁移至独立的 `gateway` 服务目录，实现连接管理与业务逻辑的物理分离。
+
+4. **共享 Protobuf 定义**  
+   - 将 Protobuf 文件及生成的 Go 代码移至项目级共享 `proto` 目录，方便 `auth` 和 `gateway` 服务统一调用，避免重复定义。
+
+5. **消除隐式全局状态**  
+   - 彻底移除之前在各 handler 中透传的全局 `DB` 变量，全部替换为明确的 `db.SQLDB` 调用，使数据流向清晰可控，预防并发问题。
+
+6. **修复依赖与路由**  
+   - 修复所有因目录调整导致的 import 路径错误，并更新 `main.go` 中的路由注册，确保服务可正常启动。
+
+## 📌 Git 提交信息（中英对照）
+
+在终端执行以下命令（或使用编辑器提交）：
+
+```bash
+git add .
+git commit -m "refactor: restructure project layout and fix global dependencies" -m "Details:
+- Relocate 'go.mod' to project root for unified module management.
+- Extract handlers into domain-driven sub-packages (account, send_email).
+- Migrate WebSocket and Hub components to a standalone 'gateway' service directory.
+- Move Protobuf files to a shared 'proto' directory for cross-service access.
+- Completely remove the deprecated global 'DB' variable, replacing it with explicit 'db.SQLDB' calls.
+- Fix all cross-package import paths and update router bindings in 'main.go'.
+
+中英对照说明：
+- 将 go.mod 移至项目根目录，确立单一 Module 统一管理。
+- 按业务域将 handlers 拆分为 account、send_email 等独立子包。
+- 将长连接相关逻辑（WebSocket、Hub）抽离至独立的 gateway 服务目录。
+- 将 Protobuf 代码移至共享 proto 目录，方便跨服务调用。
+- 彻底移除失效的隐式全局 DB 变量，全部替换为明确的 db.SQLDB 调用。
+- 修复所有因目录调整导致的 import 路径错误，并更新 main.go 的路由注册。"
+```
+
+## 🧠 架构意义解读
+
+- **单一 Module 结构**：项目成为完整的 Monorepo（大仓库），所有微服务（`auth`、`gateway`）均可直接引用内部代码，无需推送到外部包管理仓库，大幅简化开发调试。
+- **按业务域分包**：遵循领域驱动设计原则，代码按功能模块自然分离，新增功能只需创建对应包，避免 `handlers` 文件夹无限膨胀。
+- **服务边界清晰**：将长连接逻辑抽离为独立 `gateway` 服务，为后续独立部署、水平扩展打下基础。
+- **共享协议定义**：统一 `proto` 目录确保 `auth` 与 `gateway` 对消息结构的理解完全一致，消除因定义副本不同步引发的隐蔽 Bug。
+- **消除全局状态**：抛弃隐式 `DB` 变量，强制通过显式依赖传递，数据流向透明，为并发安全和单元测试提供保障。
+
+本次重构使项目结构更贴近生产级微服务标准，为后续功能迭代和团队协作奠定了坚实基础。
 
 --- WIKI PAGE: 2026.03.04-开发笔记.md ---
 
