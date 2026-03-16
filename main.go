@@ -10,8 +10,13 @@ import (
 	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/send_email"
 	"github.com/TimeCraker/game-backend-demo/services/auth/middleware"
 
-	// [引入 gateway 服务的 handlers 包，使用 gw_handlers 别名]
+	// 引入 gateway 服务的 handlers 包，使用 gw_handlers 别名
 	gw_handlers "github.com/TimeCraker/game-backend-demo/services/gateway/handlers"
+
+	// 引入 match 匹配引擎服务
+	// 修改内容：新增匹配引擎包导入
+	// 修改原因：在主服务中启动独立匹配引擎循环
+	"github.com/TimeCraker/game-backend-demo/services/match"
 
 	"github.com/gin-gonic/gin"
 )
@@ -20,6 +25,7 @@ func main() {
 	// --- 数据库模块初始化 ---
 	db.InitMySQL()
 	db.InitRedis()
+
 	// --- 启动 Gin 引擎 ---
 	r := gin.Default()
 
@@ -35,31 +41,35 @@ func main() {
 	// 将基础功能统一放入 v1 组中管理
 	v1 := r.Group("/api/v1")
 	{
-		// 基础账号功能（注册、登录）
+		// ===== 新增代码 START =====
+		// 修改内容：修正路由绑定的 Handler 名称，指向真实存在的函数
+		// 修改原因：解决 undefined: send_email.SendCodeHandler / account.RegisterHandler / account.LoginHandler 的编译错误
+		v1.POST("/send_code", send_email.SendEmailCode)
 		v1.POST("/register", account.Register)
 		v1.POST("/login", account.Login)
-		// 新增：邮箱验证码接口
-		v1.POST("/send-code", send_email.SendEmailCode)
 
+		// 需要鉴权的路由示例：/api/v1/profile
+		v1.GET("/profile", middleware.AuthMiddleware(), func(c *gin.Context) {
+			userID, _ := c.Get("userID")
+			c.JSON(200, gin.H{
+				"message": "获取用户信息成功",
+				"user_id": userID,
+			})
+		})
 	}
 
-	// 原有的认证组功能
-	api := r.Group("/api")
-
-	// 更新中间件和路由绑定
-	api.Use(middleware.AuthMiddleware())
-	{
-		// 只有带 Token 的请求才能访问 /api/me
-		api.GET("/me", account.GetMe)
-	}
-
-	// WebSocket 入口
-	// 更新 WebSocket 路由绑定
+	// 注入 Gateway 模块的长连接路由 (挂载在 /ws)
 	r.GET("/ws", gw_handlers.HandleWS())
 
-	// --- 5. 跑起来！ ---
-	log.Println("👾 游戏认证后端已在 :8081 启动")
-	if err := r.Run(":8081"); err != nil {
-		log.Fatalf("❌ 服务启动失败: %v", err)
-	}
+	// 修改内容：在此处正式拉起匹配引擎循环与网关监听
+	// 修改原因：赋予服务器撮合玩家开房对战的核心驱动力
+	log.Println("⚙️ 正在启动独立匹配引擎 Matcher...")
+	match.GlobalMatcher.Start()
+	log.Println("⚙️ 正在启动网关枢纽监听...")
+	gw_handlers.GlobalHub.ListenMatchResults()
+	// ===== 新增代码 END =====
+
+	// 启动服务器
+	log.Println("🚀 Game Auth Server 启动于 :8081")
+	r.Run(":8081")
 }

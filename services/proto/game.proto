@@ -6,7 +6,7 @@ option go_package = "./proto";
 
 // 定义统一的消息包（替代之前的 GameMessage JSON）
 message GameMessage {
-    string type = 1;     // 消息类型: chat, move, init, leave
+    string type = 1;     // 消息类型: chat, move, init, leave, match_req, match_success
     uint32 user_id = 2;  // 玩家 ID
     string content = 3;  // 聊天内容
     float x = 4;         // 坐标 X
@@ -16,6 +16,10 @@ message GameMessage {
     // 列表类型：用于同步历史记录或玩家列表
     repeated PlayerPos players = 7;
     repeated ChatLog history = 8;
+
+    // 修改内容：新增基于强类型的房间ID字段
+    // 修改原因：支持基于房间的物理隔离广播与对局，大厅聊天与房间隔离
+    string room_id = 9;
 }
 
 message PlayerPos {

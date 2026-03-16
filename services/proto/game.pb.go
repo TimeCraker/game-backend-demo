@@ -26,15 +26,19 @@ const (
 // 定义统一的消息包（替代之前的 GameMessage JSON）
 type GameMessage struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
-	Type    string                 `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`                    // 消息类型: chat, move, init, leave
+	Type    string                 `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`                    // 消息类型: chat, move, init, leave, match_req, match_success
 	UserId  uint32                 `protobuf:"varint,2,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"` // 玩家 ID
 	Content string                 `protobuf:"bytes,3,opt,name=content,proto3" json:"content,omitempty"`              // 聊天内容
 	X       float32                `protobuf:"fixed32,4,opt,name=x,proto3" json:"x,omitempty"`                        // 坐标 X
 	Y       float32                `protobuf:"fixed32,5,opt,name=y,proto3" json:"y,omitempty"`                        // 坐标 Y
 	Z       float32                `protobuf:"fixed32,6,opt,name=z,proto3" json:"z,omitempty"`                        // 坐标 Z
 	// 列表类型：用于同步历史记录或玩家列表
-	Players       []*PlayerPos `protobuf:"bytes,7,rep,name=players,proto3" json:"players,omitempty"`
-	History       []*ChatLog   `protobuf:"bytes,8,rep,name=history,proto3" json:"history,omitempty"`
+	Players []*PlayerPos `protobuf:"bytes,7,rep,name=players,proto3" json:"players,omitempty"`
+	History []*ChatLog   `protobuf:"bytes,8,rep,name=history,proto3" json:"history,omitempty"`
+	// ===== 新增代码 START =====
+	// 修改内容：新增基于强类型的房间ID字段
+	// 修改原因：支持基于房间的物理隔离广播与对局，大厅聊天与房间隔离
+	RoomId        string `protobuf:"bytes,9,opt,name=room_id,json=roomId,proto3" json:"room_id,omitempty"` // ===== 新增代码 END =====
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -123,6 +127,13 @@ func (x *GameMessage) GetHistory() []*ChatLog {
 		return x.History
 	}
 	return nil
+}
+
+func (x *GameMessage) GetRoomId() string {
+	if x != nil {
+		return x.RoomId
+	}
+	return ""
 }
 
 type PlayerPos struct {
@@ -250,7 +261,7 @@ var File_game_proto protoreflect.FileDescriptor
 const file_game_proto_rawDesc = "" +
 	"\n" +
 	"\n" +
-	"game.proto\x12\x05proto\"\xd4\x01\n" +
+	"game.proto\x12\x05proto\"\xed\x01\n" +
 	"\vGameMessage\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x17\n" +
 	"\auser_id\x18\x02 \x01(\rR\x06userId\x12\x18\n" +
@@ -259,7 +270,8 @@ const file_game_proto_rawDesc = "" +
 	"\x01y\x18\x05 \x01(\x02R\x01y\x12\f\n" +
 	"\x01z\x18\x06 \x01(\x02R\x01z\x12*\n" +
 	"\aplayers\x18\a \x03(\v2\x10.proto.PlayerPosR\aplayers\x12(\n" +
-	"\ahistory\x18\b \x03(\v2\x0e.proto.ChatLogR\ahistory\"N\n" +
+	"\ahistory\x18\b \x03(\v2\x0e.proto.ChatLogR\ahistory\x12\x17\n" +
+	"\aroom_id\x18\t \x01(\tR\x06roomId\"N\n" +
 	"\tPlayerPos\x12\x17\n" +
 	"\auser_id\x18\x01 \x01(\rR\x06userId\x12\f\n" +
 	"\x01x\x18\x02 \x01(\x02R\x01x\x12\f\n" +

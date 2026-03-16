@@ -275,6 +275,84 @@ git commit -m "refactor: restructure project layout and fix global dependencies"
 
 本次重构使项目结构更贴近生产级微服务标准，为后续功能迭代和团队协作奠定了坚实基础。
 
+--- WIKI PAGE: #-📆-2026.03.13-开发笔记：Unity-前端-UI-重构与-SPA-风格认证流程.md ---
+
+# 📆 2026.03.13 开发笔记：Unity 前端 UI 重构与 SPA 风格认证流程
+
+## ✅ 主要功能实现
+
+### Git 提交信息
+```bash
+feat(ui): implement SPA-style auth flow with UI Toolkit
+
+- 使用 UI Toolkit（UXML/USS）替换旧版 UGUI，构建组件化 UI 架构，类似 Vue/React 单页面应用。
+- 引入 DataManager 用于全局存储 JWT Token 和 UserID。
+- 添加 HttpManager 处理 RESTful API 通信（注册、验证码、登录）。
+- 实现 LoginController 控制登录/注册面板的 SPA 风格无缝切换。
+- 修复 NetManager 在 WebSocket 连接建立前处理输入的逻辑缺陷。
+- 将 3D 环境渲染延迟至认证成功后执行，确保游戏逻辑与登录界面隔离。
+```
+
+## 🧠 架构变更详解
+
+### 1. UI 层全面升级
+- **抛弃 UGUI**，全面采用 **UI Toolkit**（Unity 的新 UI 系统）。
+- 使用 **UXML** 定义结构化的界面组件，**USS** 统一管理样式，实现界面与逻辑分离。
+- `LoginController.cs` 控制视图切换和事件绑定，实现登录/注册面板的无缝切换，体验类似 SPA 前端框架。
+
+### 2. 数据管理层
+- `DataManager.cs` 作为静态类，负责缓存用户认证后的 Token 和 UserID，供全局访问。
+
+### 3. 网络层优化
+- `HttpManager.cs` 负责所有 RESTful API 调用（注册、发送验证码、登录），统一处理请求与响应。
+- `NetManager.cs` 修复了关键逻辑：在 WebSocket 连接成功前禁止处理输入，确保游戏交互仅在认证通过后触发。
+
+### 4. 场景控制
+- 将 3D 游戏环境的渲染延迟到用户成功认证之后，避免未登录玩家看到游戏世界，提升安全性和体验。
+
+## 🔥 核心踩坑记录（必读）
+
+### 1. XML 严格模式
+- 修改 `LoginView.uxml` 时，注释中**绝对不能包含 `--`**，否则 Unity 解析器会崩溃。
+- `<ui:TextField>` 绑定默认值必须使用 `value="..."`，**不能用 `text="..."`**。
+
+### 2. UI Toolkit 字体挂载
+- Unity 2022+ 对字体区分严格，**不能使用传统 TMP Font Asset**。
+- 必须通过 `Create -> Text -> Font Asset` 生成专属字体。
+- 在 Inspector 的 `Text` 栏中，必须 **清空（Unset）默认的 `Font` 槽位**，只将生成的资产拖入 `Font Asset` 槽位，否则会冲突或无法拖拽。
+
+### 3. CSS 布局塌陷
+- 在 `LoginStyles.uss` 中，最外层背景必须设置：
+  ```css
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  ```
+  否则 Unity 会将其压缩为 `0x0`，导致背景不可见。
+
+### 4. 网络状态拦截
+- `NetManager.cs` 的 `Update` 循环已加入：
+  ```csharp
+  if (_socket == null || _socket.State != WebSocketState.Open) return;
+  ```
+- **后续添加任何游戏输入逻辑时，必须确保在网络连接成功后执行**，防止在登录界面触发 3D 场景交互。
+
+## 🚀 当前状态
+
+- **前端认证闭环**：登录/注册流程完整打通，UI 响应式切换流畅，数据存储与网络请求分离清晰。
+- **后端匹配**：后端（Go）仍运行在 `localhost:8081`，API 路由为 `/api/v1`，WebSocket 为 `/ws`，支持 JWT 鉴权与 Protobuf 通信。
+- **场景隔离**：3D 环境仅在认证成功后渲染，符合产品级体验规范。
+
+## 📌 下一步开发建议
+
+### 后端
+- 可开始编写 **Match 匹配服务**，或进一步完善 Redis 状态同步逻辑。
+- 考虑将认证服务与网关服务分离，推动微服务化。
+
+### 前端
+- 构建 **游戏大厅 UI**（房间列表、玩家状态）。
+- 优化其他玩家移动的网络插值算法，消除轻微卡顿，提升同步平滑度。
+
 --- WIKI PAGE: 2026.03.04-开发笔记.md ---
 
 ---

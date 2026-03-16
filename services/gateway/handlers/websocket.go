@@ -15,6 +15,9 @@ import (
 	"github.com/TimeCraker/game-backend-demo/services/auth/db"
 	pb "github.com/TimeCraker/game-backend-demo/services/proto"
 	"google.golang.org/protobuf/proto"
+
+	// 引入匹配引擎包
+	"github.com/TimeCraker/game-backend-demo/services/match"
 )
 
 // 心跳配置常量：用于稳定性保障，防止僵尸连接
@@ -35,148 +38,121 @@ func HandleWS() gin.HandlerFunc {
 		// --- 🟢 第一步：身份大检查 (Authentication) ---
 		tokenString := c.Query("token")
 		if tokenString == "" {
-			log.Println("❌ 拒绝连接：缺少 Token")
+			log.Println("❌ 拒绝连接：缺少 token")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少 token"})
 			return
 		}
 
+		// 解析 Token 获取当前玩家 ID
 		claims, err := utils.ParseToken(tokenString)
 		if err != nil {
-			log.Printf("❌ 拒绝连接：Token 无效: %v", err)
+			log.Println("❌ 拒绝连接：无效的 token ->", err)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "无效的 token"})
 			return
 		}
 
-		userID := uint(claims.UserID)
+		// 显式转换为 int，确保全网关类型统一
+		userID := int(claims.UserID)
+		log.Printf("✅ 玩家 %d 请求建立 WebSocket 连接...", userID)
 
-		// --- 🟡 第二步：协议升级 (Upgrade) ---
+		// --- 🟡 第二步：升级协议为 WebSocket (Upgrade) ---
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
-			log.Printf("❌ 协议升级失败: %v", err)
+			log.Println("❌ 升级 WebSocket 失败:", err)
 			return
 		}
 
-		// --- 🔵 第三步：连接管理 (Management) ---
-		GlobalHub.Register(int(userID), conn)
+		// --- 🔵 第三步：注册玩家并初始化状态 (Initialization) ---
+		GlobalHub.Register(userID, conn)
+		log.Printf("🎉 玩家 %d 已成功加入 GlobalHub", userID)
 
-		// 同步最近 10 条聊天记录（聊天回溯）
-		syncChatHistory(conn)
+		// 发送当前所有在线玩家的位置数据给新登入的玩家
+		sendInitialPlayersData(conn)
 
-		// 同步当前在线的所有玩家位置给这个刚进入的玩家（功能 A）
-		syncWorldState(conn, userID)
+		// 广播给全服，有新人加入了
+		broadcastNewPlayerJoin(userID)
 
-		// 稳定性保障：配置心跳感应与读取限制
+		// --- 心跳机制 (Ping/Pong) ---
 		conn.SetReadDeadline(time.Now().Add(pongWait))
 		conn.SetPongHandler(func(string) error {
 			conn.SetReadDeadline(time.Now().Add(pongWait))
 			return nil
 		})
 
-		// 启动心跳协程
-		go func(conn *websocket.Conn) {
+		go func() {
 			ticker := time.NewTicker(pingPeriod)
 			defer ticker.Stop()
-			for range ticker.C {
+			for {
+				<-ticker.C
 				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 					return
 				}
 			}
-		}(conn)
-
-		// 2. 离场清理
-		defer func() {
-			GlobalHub.Unregister(int(userID))
-			conn.Close()
-
-			// 【更新功能：Protobuf】使用二进制格式广播下线
-			leaveMsg := &pb.GameMessage{
-				Type:   "logout",
-				UserId: uint32(userID),
-			}
-			payload, _ := proto.Marshal(leaveMsg)
-			GlobalHub.Broadcast(payload)
-
-			log.Printf("👤 玩家 %d 的连接已释放，已广播离开消息并清理资源", userID)
 		}()
 
-		log.Printf("🔌 玩家 ID:%d 已成功进入游戏大厅，[Protobuf 模式启动]", userID)
-
-		// --- 🟠 第四步：消息传送阵 (Message Loop) ---
+		// --- 🔴 第四步：死循环监听前端消息 (Read Loop) ---
 		for {
-			_, p, err := conn.ReadMessage()
+			_, message, err := conn.ReadMessage()
 			if err != nil {
-				log.Printf("⚠️ 玩家 %d 掉线或连接超时", userID)
+				log.Printf("⚠️ 玩家 %d 断开连接: %v", userID, err)
+				GlobalHub.Unregister(userID)
+
+				// 如果意外断线，顺手从匹配池中移除该玩家，防挂机
+				match.GlobalMatcher.RemovePlayer(uint32(userID))
+
+				broadcastPlayerLeave(userID)
 				break
 			}
 
-			// --- 【Protobuf】解析二进制指令 ---
-			incoming := &pb.GameMessage{}
-			if err := proto.Unmarshal(p, incoming); err != nil {
-				log.Printf("⚠️ 收到损坏的二进制包: %v", err)
+			// 解析前端发来的 Protobuf 二进制数据
+			var msg pb.GameMessage
+			if err := proto.Unmarshal(message, &msg); err != nil {
+				log.Println("❌ Protobuf 解析失败:", err)
 				continue
 			}
 
-			// 根据消息类型进行分流处理
-			switch incoming.Type {
-			case "chat":
-				handleChatLogic(userID, incoming.Content)
-			case "move":
-				handleMoveLogic(userID, float64(incoming.X), float64(incoming.Y), float64(incoming.Z))
-			default:
-				log.Printf("❓ 未知二进制指令类型: %s", incoming.Type)
+			// 拦截 1：请求匹配
+			if msg.Type == "match_req" {
+				match.GlobalMatcher.AddPlayer(uint32(userID))
+				continue // 处理完毕，阻断后续逻辑
+			}
+
+			// 拦截 2：房间内消息隔离 (只要带有 room_id 并且不是大厅的世界聊天)
+			if msg.RoomId != "" && msg.Type != "chat" {
+				// 直接在房间内广播二进制原包，不再存入任何数据库！性能起飞！
+				GlobalHub.BroadcastToRoom(msg.RoomId, message)
+				continue
+			}
+
+			// --- 如果没有被拦截，说明是大厅全局消息，走传统分流逻辑 ---
+			if msg.Type == "chat" {
+				handleChatLogic(userID, msg.Content)
+			} else if msg.Type == "move" {
+				// 仅做为大厅站街时的漫游保存
+				handleMoveLogic(userID, msg.X, msg.Y, msg.Z)
 			}
 		}
 	}
 }
 
-// 【Protobuf】同步聊天历史
-func syncChatHistory(conn *websocket.Conn) {
-	var msgs []models.Message
-	db.SQLDB.Order("id desc").Limit(10).Find(&msgs)
-
-	// 将数据库模型转换为 Protobuf 列表
-	var pbHistory []*pb.ChatLog
-	for _, m := range msgs {
-		pbHistory = append(pbHistory, &pb.ChatLog{
-			Sender:  m.Sender,
-			Content: m.Content,
-		})
-	}
-
-	data := &pb.GameMessage{
-		Type:    "chat_history",
-		History: pbHistory,
-	}
-
-	payload, _ := proto.Marshal(data)
-	// 【更新】使用 BinaryMessage 发送二进制流
-	_ = conn.WriteMessage(websocket.BinaryMessage, payload)
-}
-
-// 【更新功能：Protobuf】同步世界位置快照
-// 【修复Bug】修改查询逻辑，现在只同步当前 GlobalHub 中实际在线的玩家，过滤掉已下线的“幽灵”
-func syncWorldState(conn *websocket.Conn, currentUserID uint) {
+// 【Protobuf】下发初始化包
+func sendInitialPlayersData(conn *websocket.Conn) {
 	var pbPlayers []*pb.PlayerPos
 
-	// 遍历大总管名单，只找当前在线的玩家
 	GlobalHub.Clients.Range(func(key, value interface{}) bool {
-		onlineUserID := uint(key.(int))
-
-		// 排除掉自己，只同步别人的位置
-		if onlineUserID != currentUserID {
-			var pos models.PlayerPosition
-			// 去数据库里查这个在线玩家的最新坐标
-			if err := db.SQLDB.Where("user_id = ?", onlineUserID).First(&pos).Error; err == nil {
-				pbPlayers = append(pbPlayers, &pb.PlayerPos{
-					UserId: uint32(pos.UserID),
-					X:      float32(pos.X),
-					Y:      float32(pos.Y),
-					Z:      float32(pos.Z),
-				})
-			}
+		id := key.(int)
+		var pos models.PlayerPosition
+		if err := db.SQLDB.Where("user_id = ?", id).First(&pos).Error; err == nil {
+			pbPlayers = append(pbPlayers, &pb.PlayerPos{
+				UserId: uint32(pos.UserID),
+				X:      float32(pos.X),
+				Y:      float32(pos.Y),
+				Z:      float32(pos.Z),
+			})
 		}
 		return true
 	})
 
-	// 只有当存在其他在线玩家时，才发送初始化包
 	if len(pbPlayers) > 0 {
 		data := &pb.GameMessage{
 			Type:    "init_players",
@@ -188,8 +164,12 @@ func syncWorldState(conn *websocket.Conn, currentUserID uint) {
 	}
 }
 
+// ===== 修改代码 START =====
+// 修改内容：统一参数为 userID int，并在使用时强制转换
+// 修改原因：修复 cannot use userID (variable of type int) as uint value 的编译报错
+
 // 【Protobuf】处理聊天业务
-func handleChatLogic(userID uint, content string) {
+func handleChatLogic(userID int, content string) {
 	msgRecord := models.Message{
 		Sender:  fmt.Sprintf("玩家 %d", userID),
 		Content: content,
@@ -207,26 +187,57 @@ func handleChatLogic(userID uint, content string) {
 }
 
 // 【Protobuf】处理玩家移动业务
-func handleMoveLogic(userID uint, x, y, z float64) {
-	newPos := models.PlayerPosition{
-		UserID: userID,
+func handleMoveLogic(userID int, x, y, z float32) {
+	var pos models.PlayerPosition
+	if err := db.SQLDB.Where("user_id = ?", userID).First(&pos).Error; err != nil {
+		pos = models.PlayerPosition{UserID: uint(userID), X: float64(x), Y: float64(y), Z: float64(z)}
+		db.SQLDB.Create(&pos)
+	} else {
+		pos.X = float64(x)
+		pos.Y = float64(y)
+		pos.Z = float64(z)
+		db.SQLDB.Save(&pos)
+	}
+
+	resp := &pb.GameMessage{
+		Type:   "move",
+		UserId: uint32(userID),
 		X:      x,
 		Y:      y,
 		Z:      z,
 	}
-	db.SQLDB.Where(models.PlayerPosition{UserID: userID}).Assign(newPos).FirstOrCreate(&models.PlayerPosition{})
-
-	// 构造二进制广播包
-	moveData := &pb.GameMessage{
-		Type:   "move",
-		UserId: uint32(userID),
-		X:      float32(x),
-		Y:      float32(y),
-		Z:      float32(z),
-	}
-	payload, _ := proto.Marshal(moveData)
+	payload, _ := proto.Marshal(resp)
 	GlobalHub.Broadcast(payload)
-
-	// 保留测试用注释：
-	// log.Printf("🏃 玩家 %d 移动至 (%.2f, %.2f, %.2f)", userID, x, y, z)
 }
+
+// 【Protobuf】处理玩家加入大厅的广播
+func broadcastNewPlayerJoin(userID int) {
+	var pos models.PlayerPosition
+	if err := db.SQLDB.Where("user_id = ?", userID).First(&pos).Error; err == nil {
+		resp := &pb.GameMessage{
+			Type: "init_players",
+			Players: []*pb.PlayerPos{
+				{
+					UserId: uint32(userID),
+					X:      float32(pos.X),
+					Y:      float32(pos.Y),
+					Z:      float32(pos.Z),
+				},
+			},
+		}
+		payload, _ := proto.Marshal(resp)
+		GlobalHub.Broadcast(payload)
+	}
+}
+
+// 【Protobuf】处理玩家离开大厅的广播
+func broadcastPlayerLeave(userID int) {
+	resp := &pb.GameMessage{
+		Type:   "logout",
+		UserId: uint32(userID),
+	}
+	payload, _ := proto.Marshal(resp)
+	GlobalHub.Broadcast(payload)
+}
+
+// ===== 修改代码 END =====
