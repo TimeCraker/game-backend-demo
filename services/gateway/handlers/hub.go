@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"log"
 	"sync"
 
@@ -96,10 +97,37 @@ func (h *Hub) ListenMatchResults() {
 				Type:   "match_success",
 				RoomId: matchRes.RoomID,
 			}
-			payload, _ := proto.Marshal(successMsg)
-
-			h.SendToUser(int(matchRes.Player1), payload)
-			h.SendToUser(int(matchRes.Player2), payload)
+			// ===== 新增代码 START =====
+			// 修改内容：match_success 改为 JSON 文本消息发送给 React 前端
+			// 修改原因：大厅(React) 用 TextMessage(JSON)；战斗(Unity) 用 BinaryMessage(Protobuf) 的双端分离架构
+			// ===== 新增代码 END =====
+			if successMsg.Type == "match_success" {
+				data, err := json.Marshal(successMsg)
+				if err != nil {
+					log.Printf("❌ JSON 序列化失败: %v", err)
+				} else {
+					if c, ok := h.Clients.Load(int(matchRes.Player1)); ok {
+						conn := c.(*websocket.Conn)
+						if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+							log.Printf("❌ 发送 match_success(TextMessage) 给玩家 %d 失败: %v", matchRes.Player1, err)
+						}
+					}
+					if c, ok := h.Clients.Load(int(matchRes.Player2)); ok {
+						conn := c.(*websocket.Conn)
+						if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+							log.Printf("❌ 发送 match_success(TextMessage) 给玩家 %d 失败: %v", matchRes.Player2, err)
+						}
+					}
+				}
+			} else {
+				payload, err := proto.Marshal(successMsg)
+				if err != nil {
+					log.Printf("❌ Protobuf 序列化失败: %v", err)
+				} else {
+					h.SendToUser(int(matchRes.Player1), payload)
+					h.SendToUser(int(matchRes.Player2), payload)
+				}
+			}
 
 			log.Printf("🏠 [Hub] 物理房间 %s 已创建并通知玩家 %d 和 %d！", matchRes.RoomID, matchRes.Player1, matchRes.Player2)
 		}

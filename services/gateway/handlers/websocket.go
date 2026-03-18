@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -92,7 +93,7 @@ func HandleWS() gin.HandlerFunc {
 
 		// --- 🔴 第四步：死循环监听前端消息 (Read Loop) ---
 		for {
-			_, message, err := conn.ReadMessage()
+			messageType, message, err := conn.ReadMessage()
 			if err != nil {
 				log.Printf("⚠️ 玩家 %d 断开连接: %v", userID, err)
 				GlobalHub.Unregister(userID)
@@ -104,10 +105,26 @@ func HandleWS() gin.HandlerFunc {
 				break
 			}
 
-			// 解析前端发来的 Protobuf 二进制数据
+			// ===== 新增代码 START =====
+			// 修改内容：根据 messageType 分流解析 Text(JSON) / Binary(Protobuf)
+			// 修改原因：兼容 React 前端 JSON 文本消息与 Unity Protobuf 二进制消息的双端分离架构
+			// ===== 新增代码 END =====
+
+			// 解析前端/客户端发来的消息（Text -> JSON；Binary -> Protobuf）
 			var msg pb.GameMessage
-			if err := proto.Unmarshal(message, &msg); err != nil {
-				log.Println("❌ Protobuf 解析失败:", err)
+			switch messageType {
+			case websocket.TextMessage:
+				if err := json.Unmarshal(message, &msg); err != nil {
+					log.Println("❌ JSON 解析失败:", err)
+					continue
+				}
+			case websocket.BinaryMessage:
+				if err := proto.Unmarshal(message, &msg); err != nil {
+					log.Println("❌ Protobuf 解析失败:", err)
+					continue
+				}
+			default:
+				log.Printf("⚠️ 收到不支持的 WebSocket messageType=%d，已忽略", messageType)
 				continue
 			}
 
