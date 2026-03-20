@@ -7,64 +7,61 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	// 引入匹配包与协议包，用于解析房间与构造成功指令
 	"github.com/TimeCraker/game-backend-demo/services/match"
 	pb "github.com/TimeCraker/game-backend-demo/services/proto"
 	"google.golang.org/protobuf/proto"
 )
 
-// Client 代表一个在线的玩家连接
+// Client 代表一个在线的玩家连接（大厅或战斗）
 type Client struct {
 	UserID int
 	Conn   *websocket.Conn
+	RoomID string // 非空表示已加入某战斗房间（仅用于 Rooms 映射 bookkeeping）
 }
 
-// 修改内容：定义物理房间结构体
-// 修改原因：用于隔离存放同一对局内的玩家 UserID
+// Room 匹配引擎创建的 room 元数据（允许进入该房间的用户 ID 列表）
 type Room struct {
 	ID      string
-	Players []int // 存储房间内所有玩家的 UserID
+	Players []int
 }
 
-// Hub 是我们的“大总管”结构体
+// Hub 网关枢纽：大厅连接用 Clients；战斗房间用 Rooms + roomMu
 type Hub struct {
-	// 存放所有在线连接：key 是用户 ID，value 是对应的连接信息
-	// 使用 sync.Map 是为了保证多线程下读写安全（防止多个人同时登录/下线导致程序崩溃）
-	Clients sync.Map
+	Clients sync.Map // userID -> *websocket.Conn（大厅）
 
-	// 存放所有的活跃房间：key 是 RoomID，value 是 *Room
-	Rooms sync.Map
+	// RegisteredRooms：匹配结果写入的 room 元数据（校验玩家是否有权进入 roomId）
+	RegisteredRooms sync.Map // roomID -> *Room
+
+	roomMu sync.RWMutex
+	// Rooms：战斗 WebSocket 客户端按房间隔离（roomID -> 该房间内所有 *Client）
+	Rooms map[string]map[*Client]bool
 }
 
-// GlobalHub 定义一个全局的大总管，方便在任何地方调用
-var GlobalHub = &Hub{}
+// GlobalHub 全局 Hub
+var GlobalHub = &Hub{
+	Rooms: make(map[string]map[*Client]bool),
+}
 
-// Register 玩家上线，登记到名单
+// Register 大厅玩家上线
 func (h *Hub) Register(userID int, conn *websocket.Conn) {
 	h.Clients.Store(userID, conn)
 }
 
-// Unregister 玩家下线，从名单抹除
+// Unregister 大厅玩家下线
 func (h *Hub) Unregister(userID int) {
 	h.Clients.Delete(userID)
-	// (可选扩展) 这里如果玩家在房间内，还可以补充将其从房间踢出的逻辑
 }
 
-// Broadcast 全服广播：给所有人发消息
+// Broadcast 全服广播（大厅二进制）
 func (h *Hub) Broadcast(message []byte) {
 	h.Clients.Range(func(key, value interface{}) bool {
 		conn := value.(*websocket.Conn)
-		// 【关键修改点】将 TextMessage 改为 BinaryMessage
-		// 这样客户端接收到数据后，才会尝试按照 Protobuf 格式解析，而不是解析成字符串
 		_ = conn.WriteMessage(websocket.BinaryMessage, message)
 		return true
 	})
 }
 
-// 修改内容：新增定向单发与房间物理隔离广播机制
-// 修改原因：支持对特定玩家或特定房间内发送数据包，终结无差别全服广播
-
-// SendToUser 精准向某一位玩家发送消息
+// SendToUser 单播给指定 user（大厅 map 中的连接）
 func (h *Hub) SendToUser(userID int, message []byte) {
 	if c, ok := h.Clients.Load(userID); ok {
 		conn := c.(*websocket.Conn)
@@ -72,17 +69,77 @@ func (h *Hub) SendToUser(userID int, message []byte) {
 	}
 }
 
-// BroadcastToRoom 房间内物理隔离广播
-func (h *Hub) BroadcastToRoom(roomID string, message []byte) {
-	if r, ok := h.Rooms.Load(roomID); ok {
-		room := r.(*Room)
-		for _, uid := range room.Players {
-			h.SendToUser(uid, message)
+// JoinRoom 将战斗客户端加入 Rooms[roomID]（须已持有 *Client，Conn 已就绪）
+func (h *Hub) JoinRoom(client *Client, roomID string) {
+	if client == nil || roomID == "" || client.Conn == nil {
+		return
+	}
+	h.roomMu.Lock()
+	defer h.roomMu.Unlock()
+	if h.Rooms == nil {
+		h.Rooms = make(map[string]map[*Client]bool)
+	}
+	m, ok := h.Rooms[roomID]
+	if !ok {
+		m = make(map[*Client]bool)
+		h.Rooms[roomID] = m
+	}
+	client.RoomID = roomID
+	m[client] = true
+}
+
+// LeaveRoom 从 Rooms 中移除战斗客户端
+func (h *Hub) LeaveRoom(client *Client) {
+	if client == nil || client.RoomID == "" {
+		return
+	}
+	h.roomMu.Lock()
+	defer h.roomMu.Unlock()
+	roomID := client.RoomID
+	if m, ok := h.Rooms[roomID]; ok {
+		delete(m, client)
+		if len(m) == 0 {
+			delete(h.Rooms, roomID)
 		}
+	}
+	client.RoomID = ""
+}
+
+// BroadcastToRoom 向某房间内所有战斗连接广播（保持原始 WebSocket 帧类型）
+func (h *Hub) BroadcastToRoom(roomID string, messageType int, message []byte) {
+	if roomID == "" {
+		return
+	}
+	h.roomMu.RLock()
+	m := h.Rooms[roomID]
+	clients := make([]*Client, 0, len(m))
+	for c := range m {
+		clients = append(clients, c)
+	}
+	h.roomMu.RUnlock()
+
+	for _, c := range clients {
+		if c == nil || c.Conn == nil {
+			continue
+		}
+		_ = c.Conn.WriteMessage(messageType, message)
 	}
 }
 
-// ListenMatchResults 独立协程：监听匹配引擎搓合结果并进行开房
+// RoomHasUser 判断用户是否在匹配注册的该房间成员列表中
+func (h *Hub) RoomHasUser(roomID string, userID int) bool {
+	if r, ok := h.RegisteredRooms.Load(roomID); ok {
+		room := r.(*Room)
+		for _, uid := range room.Players {
+			if uid == userID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ListenMatchResults 监听匹配结果并开房
 func (h *Hub) ListenMatchResults() {
 	go func() {
 		for matchRes := range match.GlobalMatcher.ResultCh {
@@ -90,17 +147,12 @@ func (h *Hub) ListenMatchResults() {
 				ID:      matchRes.RoomID,
 				Players: []int{int(matchRes.Player1), int(matchRes.Player2)},
 			}
-			h.Rooms.Store(matchRes.RoomID, room)
+			h.RegisteredRooms.Store(matchRes.RoomID, room)
 
-			// 构造 match_success 消息通知前端切场景
 			successMsg := &pb.GameMessage{
 				Type:   "match_success",
 				RoomId: matchRes.RoomID,
 			}
-			// ===== 新增代码 START =====
-			// 修改内容：match_success 改为 JSON 文本消息发送给 React 前端
-			// 修改原因：大厅(React) 用 TextMessage(JSON)；战斗(Unity) 用 BinaryMessage(Protobuf) 的双端分离架构
-			// ===== 新增代码 END =====
 			if successMsg.Type == "match_success" {
 				data, err := json.Marshal(successMsg)
 				if err != nil {

@@ -13,8 +13,99 @@ import (
 	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/send_email"
 	"github.com/TimeCraker/game-backend-demo/services/auth/middleware"
 
-	// [引入 gateway 服务的 handlers 包，使用 gw_handlers 别名]
+	// 引入 gateway 服务的 handlers 包，使用 gw_handlers 别名
 	gw_handlers "github.com/TimeCraker/game-backend-demo/services/gateway/handlers"
+
+	// 引入 match 匹配引擎服务
+	// 修改内容：新增匹配引擎包导入
+	// 修改原因：在主服务中启动独立匹配引擎循环
+	"github.com/TimeCraker/game-backend-demo/services/match"
+
+	"github.com/gin-gonic/gin"
+)
+
+func main() {
+	// --- 数据库模块初始化 ---
+	db.InitMySQL()
+	db.InitRedis()
+
+	// --- 启动 Gin 引擎 ---
+	r := gin.Default()
+
+
+	// 修改内容：增加全局 CORS 跨域中间件
+	// 修改原因：支持前后端分离架构下，React 前端 (localhost:3000) 发起的 OPTIONS 预检请求与 POST 请求
+	r.Use(func(c *gin.Context) {
+		// 允许你的前端地址跨域（开发环境可以先写 "*"，或者严格写明你的前端地址）
+		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
+
+		// 拦截 OPTIONS 预检请求，直接返回 204 无内容状态码
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+
+		c.Next()
+	})
+
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"status": "up",
+			"mysql":  "connected",
+			"redis":  "connected",
+		})
+	})
+
+	// --- 路由注册 ---
+	// 将基础功能统一放入 v1 组中管理
+	v1 := r.Group("/api/v1")
+	{
+
+		// 修改内容：修正路由绑定的 Handler 名称，指向真实存在的函数
+		// 修改原因：解决 undefined: send_email.SendCodeHandler / account.RegisterHandler / account.LoginHandler 的编译错误
+		v1.POST("/send_code", send_email.SendEmailCode)
+		v1.POST("/register", account.Register)
+		v1.POST("/login", account.Login)
+
+		// 需要鉴权的路由示例：/api/v1/profile
+		v1.GET("/profile", middleware.AuthMiddleware(), func(c *gin.Context) {
+			userID, _ := c.Get("userID")
+			c.JSON(200, gin.H{
+				"message": "获取用户信息成功",
+				"user_id": userID,
+			})
+		})
+	}
+
+	// 注入 Gateway 模块的长连接路由 (挂载在 /ws)
+	r.GET("/ws", gw_handlers.HandleWS())
+
+	// 修改内容：在此处正式拉起匹配引擎循环与网关监听
+	// 修改原因：赋予服务器撮合玩家开房对战的核心驱动力
+	log.Println("⚙️ 正在启动独立匹配引擎 Matcher...")
+	match.GlobalMatcher.Start()
+	log.Println("⚙️ 正在启动网关枢纽监听...")
+	gw_handlers.GlobalHub.ListenMatchResults()
+
+	// 启动服务器
+	log.Println("🚀 Game Auth Server 启动于 :8081")
+	r.Run(":8081")
+}
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\main.go ---
+
+package main
+
+import (
+	"log"
+
+	"github.com/TimeCraker/game-backend-demo/services/auth/db"
+	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/account"
+	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/send_email"
+	"github.com/TimeCraker/game-backend-demo/services/auth/middleware"
 
 	"github.com/gin-gonic/gin"
 )
@@ -35,10 +126,13 @@ func main() {
 	})
 
 	// --- 路由注册 ---
-	// 将基础功能统一放入 v1 组中管理
+
+	// 根据你的建议，将基础功能统一放入 v1 组中管理
 	v1 := r.Group("/api/v1")
 	{
 		// 基础账号功能（注册、登录）
+
+		// 更新路由绑定，使用新的包名前缀
 		v1.POST("/register", account.Register)
 		v1.POST("/login", account.Login)
 		// 新增：邮箱验证码接口
@@ -58,8 +152,6 @@ func main() {
 
 	// WebSocket 入口
 	// 更新 WebSocket 路由绑定
-	r.GET("/ws", gw_handlers.HandleWS())
-
 	// --- 5. 跑起来！ ---
 	log.Println("👾 游戏认证后端已在 :8081 启动")
 	if err := r.Run(":8081"); err != nil {
@@ -150,8 +242,10 @@ func SetUserOnline(userID uint) error {
 package account
 
 import (
+	"fmt"
 	"log"
 	"net/http"
+	"time" // 修复报错：引入 time 包
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -174,18 +268,61 @@ func Login(c *gin.Context) {
 		return
 	}
 
+	// ===== 新增代码 START =====
+	// 登录防爆破：基于 Redis 的失败次数计数与封禁
+	clientIP := c.ClientIP()
+	identifier := input.Username
+	if identifier == "" {
+		identifier = clientIP
+	}
+	failKey := fmt.Sprintf("login_fail_count:%s", identifier)
+
+	// 先检查当前是否已被封禁
+	// 修复报错：将声明但未使用的 countStr 改为 _
+	if _, err := db.RDB.Get(db.Ctx, failKey).Result(); err == nil {
+		// 已存在计数时进行阈值判断
+		// 不严格区分解析错误，失败时默认跳过，避免因为 Redis 问题影响正常登录
+		var current int64
+		if n, parseErr := db.RDB.Get(db.Ctx, failKey).Int64(); parseErr == nil {
+			current = n
+		}
+
+		if current >= 20 {
+			_ = db.RDB.Expire(db.Ctx, failKey, 24*time.Hour).Err()
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "恶意请求，封禁 24 小时"})
+			return
+		}
+		if current >= 10 {
+			_ = db.RDB.Expire(db.Ctx, failKey, 5*time.Minute).Err()
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "尝试次数过多，请 5 分钟后再试"})
+			return
+		}
+	}
+	// ===== 新增代码 END =====
+
 	// 2. 查数据库找用户
 	var user models.User
 	// 【改动点】使用全局变量 DB 替代 mysqlDB
 
 	// 替换失效的 DB 为 db.SQLDB
 	if err := db.SQLDB.Where("username = ?", input.Username).First(&user).Error; err != nil {
+		// ===== 新增代码 START =====
+		// 用户名不存在也视为一次失败尝试，增加计数
+		_ = db.RDB.Incr(db.Ctx, failKey).Err()
+		// 对新创建的计数设置基础过期时间，避免长期占用
+		_ = db.RDB.Expire(db.Ctx, failKey, 5*time.Minute).Err()
+		// ===== 新增代码 END =====
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
 	}
 
 	// 3. 验证密码 (Bcrypt 发挥作用的地方)
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)); err != nil {
+		// ===== 新增代码 START =====
+		// 密码错误，同样累加失败计数并设置过期
+		_ = db.RDB.Incr(db.Ctx, failKey).Err()
+		_ = db.RDB.Expire(db.Ctx, failKey, 5*time.Minute).Err()
+		// ===== 新增代码 END =====
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
 	}
@@ -206,6 +343,11 @@ func Login(c *gin.Context) {
 	} else {
 		log.Printf("👤 玩家 ID:%d 已上线，在线状态已存入 Redis", user.ID)
 	}
+
+	// ===== 新增代码 START =====
+	// 登录成功后清空失败计数，防止历史失败影响后续正常登录
+	_ = db.RDB.Del(db.Ctx, failKey).Err()
+	// ===== 新增代码 END =====
 	// ============================================================
 
 	// 6. 返回结果
@@ -674,9 +816,16 @@ func ParseToken(tokenString string) (*Claims, error) {
 package handlers
 
 import (
+	"encoding/json"
+	"log"
 	"sync"
 
 	"github.com/gorilla/websocket"
+
+	// 引入匹配包与协议包，用于解析房间与构造成功指令
+	"github.com/TimeCraker/game-backend-demo/services/match"
+	pb "github.com/TimeCraker/game-backend-demo/services/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // Client 代表一个在线的玩家连接
@@ -685,15 +834,79 @@ type Client struct {
 	Conn   *websocket.Conn
 }
 
+// 修改内容：定义物理房间结构体
+// 修改原因：用于隔离存放同一对局内的玩家 UserID
+type Room struct {
+	ID      string
+	Players []int // 存储房间内所有玩家的 UserID
+}
+
 // Hub 是我们的“大总管”结构体
 type Hub struct {
 	// 存放所有在线连接：key 是用户 ID，value 是对应的连接信息
 	// 使用 sync.Map 是为了保证多线程下读写安全（防止多个人同时登录/下线导致程序崩溃）
 	Clients sync.Map
+
+	// 存放所有的活跃房间：key 是 RoomID，value 是 *Room
+	Rooms sync.Map
 }
 
 // GlobalHub 定义一个全局的大总管，方便在任何地方调用
 var GlobalHub = &Hub{}
+
+// ===== 新增代码 START =====
+// RoomManager：用于“物理房间隔离”的房间级连接管理。
+// 修改原因：彻底废弃战斗连接的全局 GlobalHub 广播，确保 move/开火等消息只在同 room_id 内广播。
+// 影响范围：仅影响 gateway 的战斗 WebSocket 转发链路；大厅逻辑仍由 GlobalHub 负责。
+type RoomManager struct {
+	roomID string
+	// clients：房间内所有连接（key=userID）
+	clients sync.Map
+}
+
+// roomManagers：全局房间管理器注册表（key=roomID）
+var roomManagers sync.Map
+
+// GetOrCreateRoomManager 动态获取或创建某个 room_id 对应的隔离实例
+func GetOrCreateRoomManager(roomID string) *RoomManager {
+	if roomID == "" {
+		return nil
+	}
+	if rm, ok := roomManagers.Load(roomID); ok {
+		return rm.(*RoomManager)
+	}
+	rm := &RoomManager{roomID: roomID}
+	actual, _ := roomManagers.LoadOrStore(roomID, rm)
+	return actual.(*RoomManager)
+}
+
+func (rm *RoomManager) Join(userID int, conn *websocket.Conn) {
+	if rm == nil {
+		return
+	}
+	rm.clients.Store(userID, conn)
+}
+
+func (rm *RoomManager) Leave(userID int) {
+	if rm == nil {
+		return
+	}
+	rm.clients.Delete(userID)
+}
+
+// BroadcastRoom 在房间内部广播原始消息（保持 messageType 与 message bytes 不变）
+func (rm *RoomManager) BroadcastRoom(messageType int, message []byte) {
+	if rm == nil {
+		return
+	}
+	rm.clients.Range(func(_, value interface{}) bool {
+		conn := value.(*websocket.Conn)
+		// 保持原 messageType，避免 TextMessage 被当成 BinaryMessage 发送
+		_ = conn.WriteMessage(messageType, message)
+		return true
+	})
+}
+// ===== 新增代码 END =====
 
 // Register 玩家上线，登记到名单
 func (h *Hub) Register(userID int, conn *websocket.Conn) {
@@ -703,6 +916,7 @@ func (h *Hub) Register(userID int, conn *websocket.Conn) {
 // Unregister 玩家下线，从名单抹除
 func (h *Hub) Unregister(userID int) {
 	h.Clients.Delete(userID)
+	// (可选扩展) 这里如果玩家在房间内，还可以补充将其从房间踢出的逻辑
 }
 
 // Broadcast 全服广播：给所有人发消息
@@ -716,11 +930,135 @@ func (h *Hub) Broadcast(message []byte) {
 	})
 }
 
+// 修改内容：新增定向单发与房间物理隔离广播机制
+// 修改原因：支持对特定玩家或特定房间内发送数据包，终结无差别全服广播
+
+// SendToUser 精准向某一位玩家发送消息
+func (h *Hub) SendToUser(userID int, message []byte) {
+	if c, ok := h.Clients.Load(userID); ok {
+		conn := c.(*websocket.Conn)
+		_ = conn.WriteMessage(websocket.BinaryMessage, message)
+	}
+}
+
+// BroadcastToRoom 房间内物理隔离广播
+func (h *Hub) BroadcastToRoom(roomID string, message []byte) {
+	if r, ok := h.Rooms.Load(roomID); ok {
+		room := r.(*Room)
+		for _, uid := range room.Players {
+			h.SendToUser(uid, message)
+		}
+	}
+}
+
+// ===== 新增代码 START =====
+// 修改内容：为房间增加 Join/Leave 与成员校验
+// 修改原因：支持 WebSocket 连接时携带 room_id，动态加入/退出对应物理房间，彻底隔离广播范围
+// 影响范围：仅影响 gateway 的 Room 管理逻辑
+
+// RoomHasUser 判断某玩家是否属于该房间
+func (h *Hub) RoomHasUser(roomID string, userID int) bool {
+	if r, ok := h.Rooms.Load(roomID); ok {
+		room := r.(*Room)
+		for _, uid := range room.Players {
+			if uid == userID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// JoinRoom 将玩家加入房间（若不在房间中则追加）
+func (h *Hub) JoinRoom(roomID string, userID int) bool {
+	if r, ok := h.Rooms.Load(roomID); ok {
+		room := r.(*Room)
+		for _, uid := range room.Players {
+			if uid == userID {
+				return true
+			}
+		}
+		room.Players = append(room.Players, userID)
+		h.Rooms.Store(roomID, room)
+		return true
+	}
+	return false
+}
+
+// LeaveRoom 将玩家从房间移除（断线/退出）
+func (h *Hub) LeaveRoom(roomID string, userID int) {
+	if r, ok := h.Rooms.Load(roomID); ok {
+		room := r.(*Room)
+		next := make([]int, 0, len(room.Players))
+		for _, uid := range room.Players {
+			if uid != userID {
+				next = append(next, uid)
+			}
+		}
+		room.Players = next
+		h.Rooms.Store(roomID, room)
+	}
+}
+// ===== 新增代码 END =====
+
+// ListenMatchResults 独立协程：监听匹配引擎搓合结果并进行开房
+func (h *Hub) ListenMatchResults() {
+	go func() {
+		for matchRes := range match.GlobalMatcher.ResultCh {
+			room := &Room{
+				ID:      matchRes.RoomID,
+				Players: []int{int(matchRes.Player1), int(matchRes.Player2)},
+			}
+			h.Rooms.Store(matchRes.RoomID, room)
+
+			// 构造 match_success 消息通知前端切场景
+			successMsg := &pb.GameMessage{
+				Type:   "match_success",
+				RoomId: matchRes.RoomID,
+			}
+			// ===== 新增代码 START =====
+			// 修改内容：match_success 改为 JSON 文本消息发送给 React 前端
+			// 修改原因：大厅(React) 用 TextMessage(JSON)；战斗(Unity) 用 BinaryMessage(Protobuf) 的双端分离架构
+			// ===== 新增代码 END =====
+			if successMsg.Type == "match_success" {
+				data, err := json.Marshal(successMsg)
+				if err != nil {
+					log.Printf("❌ JSON 序列化失败: %v", err)
+				} else {
+					if c, ok := h.Clients.Load(int(matchRes.Player1)); ok {
+						conn := c.(*websocket.Conn)
+						if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+							log.Printf("❌ 发送 match_success(TextMessage) 给玩家 %d 失败: %v", matchRes.Player1, err)
+						}
+					}
+					if c, ok := h.Clients.Load(int(matchRes.Player2)); ok {
+						conn := c.(*websocket.Conn)
+						if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+							log.Printf("❌ 发送 match_success(TextMessage) 给玩家 %d 失败: %v", matchRes.Player2, err)
+						}
+					}
+				}
+			} else {
+				payload, err := proto.Marshal(successMsg)
+				if err != nil {
+					log.Printf("❌ Protobuf 序列化失败: %v", err)
+				} else {
+					h.SendToUser(int(matchRes.Player1), payload)
+					h.SendToUser(int(matchRes.Player2), payload)
+				}
+			}
+
+			log.Printf("🏠 [Hub] 物理房间 %s 已创建并通知玩家 %d 和 %d！", matchRes.RoomID, matchRes.Player1, matchRes.Player2)
+		}
+	}()
+}
+
 --- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\gateway\handlers\websocket.go ---
 
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -735,6 +1073,9 @@ import (
 	"github.com/TimeCraker/game-backend-demo/services/auth/db"
 	pb "github.com/TimeCraker/game-backend-demo/services/proto"
 	"google.golang.org/protobuf/proto"
+
+	// 引入匹配引擎包
+	"github.com/TimeCraker/game-backend-demo/services/match"
 )
 
 // 心跳配置常量：用于稳定性保障，防止僵尸连接
@@ -755,148 +1096,179 @@ func HandleWS() gin.HandlerFunc {
 		// --- 🟢 第一步：身份大检查 (Authentication) ---
 		tokenString := c.Query("token")
 		if tokenString == "" {
-			log.Println("❌ 拒绝连接：缺少 Token")
+			log.Println("❌ 拒绝连接：缺少 token")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少 token"})
 			return
 		}
 
+		// 解析 Token 获取当前玩家 ID
 		claims, err := utils.ParseToken(tokenString)
 		if err != nil {
-			log.Printf("❌ 拒绝连接：Token 无效: %v", err)
+			log.Println("❌ 拒绝连接：无效的 token ->", err)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "无效的 token"})
 			return
 		}
 
-		userID := uint(claims.UserID)
+		// 显式转换为 int，确保全网关类型统一
+		userID := int(claims.UserID)
+		log.Printf("✅ 玩家 %d 请求建立 WebSocket 连接...", userID)
 
-		// --- 🟡 第二步：协议升级 (Upgrade) ---
+		// ===== 新增代码 START =====
+		// 修改内容：读取 room_id 用于战斗房间隔离
+		// 修改原因：匹配成功后，Unity/客户端会携带 room_id 建立连接；必须加入对应物理房间，杜绝世界广播
+		// 影响范围：仅影响携带 room_id 的 WS 连接（战斗连接）
+		roomID := c.Query("room_id")
+		if roomID == "" {
+			log.Printf("🧭 玩家 %d 建立大厅 WS（room_id 为空）", userID)
+		} else {
+			log.Printf("🧭 玩家 %d 建立战斗 WS（room_id=%s）", userID, roomID)
+		}
+		// ===== 新增代码 END =====
+
+		// --- 🟡 第二步：升级协议为 WebSocket (Upgrade) ---
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
-			log.Printf("❌ 协议升级失败: %v", err)
+			log.Println("❌ 升级 WebSocket 失败:", err)
 			return
 		}
 
-		// --- 🔵 第三步：连接管理 (Management) ---
-		GlobalHub.Register(int(userID), conn)
+		// --- 🔵 第三步：注册玩家并初始化状态 (Initialization) ---
+		// 重要：battle 连接必须彻底脱离 GlobalHub 广播链路，否则 GlobalHub 广播会把战斗连接也当作大厅在线成员一起推送。
+		if roomID == "" {
+			// 大厅连接：加入 GlobalHub，并初始化大厅站街数据
+			GlobalHub.Register(userID, conn)
+			log.Printf("🎉 玩家 %d 已成功加入 GlobalHub", userID)
+			// 发送当前所有在线玩家的位置数据给新登入的玩家
+			sendInitialPlayersData(conn)
+			// 广播给全服，有新人加入了
+			broadcastNewPlayerJoin(userID)
+		} else {
+			// 战斗连接：仅加入隔离房间管理器 RoomManager，不注册进 GlobalHub。
+			if !GlobalHub.RoomHasUser(roomID, userID) {
+				log.Printf("❌ 玩家 %d 尝试加入非法房间 room_id=%s，已拒绝", userID, roomID)
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"非法房间"}`))
+				_ = conn.Close()
+				return
+			}
+			roomMgr := GetOrCreateRoomManager(roomID)
+			roomMgr.Join(userID, conn)
+			log.Printf("🏠 玩家 %d 已加入物理房间隔离链路 room_id=%s", userID, roomID)
+		}
 
-		// 同步最近 10 条聊天记录（聊天回溯）
-		syncChatHistory(conn)
-
-		// 同步当前在线的所有玩家位置给这个刚进入的玩家（功能 A）
-		syncWorldState(conn, userID)
-
-		// 稳定性保障：配置心跳感应与读取限制
+		// --- 心跳机制 (Ping/Pong) ---
 		conn.SetReadDeadline(time.Now().Add(pongWait))
 		conn.SetPongHandler(func(string) error {
 			conn.SetReadDeadline(time.Now().Add(pongWait))
 			return nil
 		})
 
-		// 启动心跳协程
-		go func(conn *websocket.Conn) {
+		go func() {
 			ticker := time.NewTicker(pingPeriod)
 			defer ticker.Stop()
-			for range ticker.C {
+			for {
+				<-ticker.C
 				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 					return
 				}
 			}
-		}(conn)
-
-		// 2. 离场清理
-		defer func() {
-			GlobalHub.Unregister(int(userID))
-			conn.Close()
-
-			// 【更新功能：Protobuf】使用二进制格式广播下线
-			leaveMsg := &pb.GameMessage{
-				Type:   "logout",
-				UserId: uint32(userID),
-			}
-			payload, _ := proto.Marshal(leaveMsg)
-			GlobalHub.Broadcast(payload)
-
-			log.Printf("👤 玩家 %d 的连接已释放，已广播离开消息并清理资源", userID)
 		}()
 
-		log.Printf("🔌 玩家 ID:%d 已成功进入游戏大厅，[Protobuf 模式启动]", userID)
-
-		// --- 🟠 第四步：消息传送阵 (Message Loop) ---
+		// --- 🔴 第四步：死循环监听前端消息 (Read Loop) ---
 		for {
-			_, p, err := conn.ReadMessage()
+			messageType, message, err := conn.ReadMessage()
 			if err != nil {
-				log.Printf("⚠️ 玩家 %d 掉线或连接超时", userID)
+				log.Printf("⚠️ 玩家 %d 断开连接 (room_id=%s): %v", userID, roomID, err)
+
+				// 如果意外断线，顺手从匹配池中移除该玩家，防挂机
+				match.GlobalMatcher.RemovePlayer(uint32(userID))
+
+				if roomID != "" {
+					roomMgr := GetOrCreateRoomManager(roomID)
+					roomMgr.Leave(userID)
+					log.Printf("🏚️ 玩家 %d 已离开物理房间隔离链路 room_id=%s", userID, roomID)
+				} else {
+					GlobalHub.Unregister(userID)
+					broadcastPlayerLeave(userID)
+				}
 				break
 			}
 
-			// --- 【Protobuf】解析二进制指令 ---
-			incoming := &pb.GameMessage{}
-			if err := proto.Unmarshal(p, incoming); err != nil {
-				log.Printf("⚠️ 收到损坏的二进制包: %v", err)
+			// ===== 新增代码 START =====
+			// 修改内容：根据 messageType 分流解析 Text(JSON) / Binary(Protobuf)
+			// 修改原因：兼容 React 前端 JSON 文本消息与 Unity Protobuf 二进制消息的双端分离架构
+			// ===== 新增代码 END =====
+
+			// 解析前端/客户端发来的消息（Text -> JSON；Binary -> Protobuf）
+			var msg pb.GameMessage
+			switch messageType {
+			case websocket.TextMessage:
+				if err := json.Unmarshal(message, &msg); err != nil {
+					log.Println("❌ JSON 解析失败:", err)
+					continue
+				}
+			case websocket.BinaryMessage:
+				if err := proto.Unmarshal(message, &msg); err != nil {
+					log.Println("❌ Protobuf 解析失败:", err)
+					continue
+				}
+			default:
+				log.Printf("⚠️ 收到不支持的 WebSocket messageType=%d，已忽略", messageType)
 				continue
 			}
 
-			// 根据消息类型进行分流处理
-			switch incoming.Type {
-			case "chat":
-				handleChatLogic(userID, incoming.Content)
-			case "move":
-				handleMoveLogic(userID, float64(incoming.X), float64(incoming.Y), float64(incoming.Z))
-			default:
-				log.Printf("❓ 未知二进制指令类型: %s", incoming.Type)
+			// ===== 新增代码 START =====
+			// 战斗连接：强制房间内转发，彻底禁用 GlobalHub 广播链路
+			if roomID != "" {
+				roomMgr := GetOrCreateRoomManager(roomID)
+				roomMgr.BroadcastRoom(messageType, message)
+				continue
+			}
+			// ===== 新增代码 END =====
+
+			// 拦截 1：请求匹配
+			if msg.Type == "match_req" {
+				match.GlobalMatcher.AddPlayer(uint32(userID))
+				continue // 处理完毕，阻断后续逻辑
+			}
+
+			// 拦截 2：房间内消息隔离 (只要带有 room_id 并且不是大厅的世界聊天)
+			if msg.RoomId != "" && msg.Type != "chat" {
+				// 直接在房间内广播原包，不再走 GlobalHub 广播链路，确保 move/开火等只在 room_id 内传播
+				roomMgr := GetOrCreateRoomManager(msg.RoomId)
+				roomMgr.BroadcastRoom(messageType, message)
+				continue
+			}
+
+			// --- 如果没有被拦截，说明是大厅全局消息，走传统分流逻辑 ---
+			if msg.Type == "chat" {
+				handleChatLogic(userID, msg.Content)
+			} else if msg.Type == "move" {
+				// 仅做为大厅站街时的漫游保存
+				handleMoveLogic(userID, msg.X, msg.Y, msg.Z)
 			}
 		}
 	}
 }
 
-// 【Protobuf】同步聊天历史
-func syncChatHistory(conn *websocket.Conn) {
-	var msgs []models.Message
-	db.SQLDB.Order("id desc").Limit(10).Find(&msgs)
-
-	// 将数据库模型转换为 Protobuf 列表
-	var pbHistory []*pb.ChatLog
-	for _, m := range msgs {
-		pbHistory = append(pbHistory, &pb.ChatLog{
-			Sender:  m.Sender,
-			Content: m.Content,
-		})
-	}
-
-	data := &pb.GameMessage{
-		Type:    "chat_history",
-		History: pbHistory,
-	}
-
-	payload, _ := proto.Marshal(data)
-	// 【更新】使用 BinaryMessage 发送二进制流
-	_ = conn.WriteMessage(websocket.BinaryMessage, payload)
-}
-
-// 【更新功能：Protobuf】同步世界位置快照
-// 【修复Bug】修改查询逻辑，现在只同步当前 GlobalHub 中实际在线的玩家，过滤掉已下线的“幽灵”
-func syncWorldState(conn *websocket.Conn, currentUserID uint) {
+// 【Protobuf】下发初始化包
+func sendInitialPlayersData(conn *websocket.Conn) {
 	var pbPlayers []*pb.PlayerPos
 
-	// 遍历大总管名单，只找当前在线的玩家
 	GlobalHub.Clients.Range(func(key, value interface{}) bool {
-		onlineUserID := uint(key.(int))
-
-		// 排除掉自己，只同步别人的位置
-		if onlineUserID != currentUserID {
-			var pos models.PlayerPosition
-			// 去数据库里查这个在线玩家的最新坐标
-			if err := db.SQLDB.Where("user_id = ?", onlineUserID).First(&pos).Error; err == nil {
-				pbPlayers = append(pbPlayers, &pb.PlayerPos{
-					UserId: uint32(pos.UserID),
-					X:      float32(pos.X),
-					Y:      float32(pos.Y),
-					Z:      float32(pos.Z),
-				})
-			}
+		id := key.(int)
+		var pos models.PlayerPosition
+		if err := db.SQLDB.Where("user_id = ?", id).First(&pos).Error; err == nil {
+			pbPlayers = append(pbPlayers, &pb.PlayerPos{
+				UserId: uint32(pos.UserID),
+				X:      float32(pos.X),
+				Y:      float32(pos.Y),
+				Z:      float32(pos.Z),
+				RotY:   0,
+			})
 		}
 		return true
 	})
 
-	// 只有当存在其他在线玩家时，才发送初始化包
 	if len(pbPlayers) > 0 {
 		data := &pb.GameMessage{
 			Type:    "init_players",
@@ -908,8 +1280,12 @@ func syncWorldState(conn *websocket.Conn, currentUserID uint) {
 	}
 }
 
+// ===== 修改代码 START =====
+// 修改内容：统一参数为 userID int，并在使用时强制转换
+// 修改原因：修复 cannot use userID (variable of type int) as uint value 的编译报错
+
 // 【Protobuf】处理聊天业务
-func handleChatLogic(userID uint, content string) {
+func handleChatLogic(userID int, content string) {
 	msgRecord := models.Message{
 		Sender:  fmt.Sprintf("玩家 %d", userID),
 		Content: content,
@@ -927,28 +1303,162 @@ func handleChatLogic(userID uint, content string) {
 }
 
 // 【Protobuf】处理玩家移动业务
-func handleMoveLogic(userID uint, x, y, z float64) {
-	newPos := models.PlayerPosition{
-		UserID: userID,
+func handleMoveLogic(userID int, x, y, z float32) {
+	var pos models.PlayerPosition
+	if err := db.SQLDB.Where("user_id = ?", userID).First(&pos).Error; err != nil {
+		pos = models.PlayerPosition{UserID: uint(userID), X: float64(x), Y: float64(y), Z: float64(z)}
+		db.SQLDB.Create(&pos)
+	} else {
+		pos.X = float64(x)
+		pos.Y = float64(y)
+		pos.Z = float64(z)
+		db.SQLDB.Save(&pos)
+	}
+
+	resp := &pb.GameMessage{
+		Type:   "move",
+		UserId: uint32(userID),
 		X:      x,
 		Y:      y,
 		Z:      z,
 	}
-	db.SQLDB.Where(models.PlayerPosition{UserID: userID}).Assign(newPos).FirstOrCreate(&models.PlayerPosition{})
-
-	// 构造二进制广播包
-	moveData := &pb.GameMessage{
-		Type:   "move",
-		UserId: uint32(userID),
-		X:      float32(x),
-		Y:      float32(y),
-		Z:      float32(z),
-	}
-	payload, _ := proto.Marshal(moveData)
+	payload, _ := proto.Marshal(resp)
 	GlobalHub.Broadcast(payload)
+}
 
-	// 保留测试用注释：
-	// log.Printf("🏃 玩家 %d 移动至 (%.2f, %.2f, %.2f)", userID, x, y, z)
+// 【Protobuf】处理玩家加入大厅的广播
+func broadcastNewPlayerJoin(userID int) {
+	var pos models.PlayerPosition
+	if err := db.SQLDB.Where("user_id = ?", userID).First(&pos).Error; err == nil {
+		resp := &pb.GameMessage{
+			Type: "init_players",
+			Players: []*pb.PlayerPos{
+				{
+					UserId: uint32(userID),
+					X:      float32(pos.X),
+					Y:      float32(pos.Y),
+					Z:      float32(pos.Z),
+					RotY:   0,
+				},
+			},
+		}
+		payload, _ := proto.Marshal(resp)
+		GlobalHub.Broadcast(payload)
+	}
+}
+
+// 【Protobuf】处理玩家离开大厅的广播
+func broadcastPlayerLeave(userID int) {
+	resp := &pb.GameMessage{
+		Type:   "logout",
+		UserId: uint32(userID),
+	}
+	payload, _ := proto.Marshal(resp)
+	GlobalHub.Broadcast(payload)
+}
+
+// ===== 修改代码 END =====
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\match\matcher.go ---
+
+// --- FILE: services/match/matcher.go ---
+package match
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ===== 新增代码 START =====
+// 修改内容：创建独立的基于 Tick 循环的匹配引擎
+// 修改原因：将匹配逻辑与网关长连接彻底物理隔离，对标微服务架构
+// 影响范围：独立的业务包，后续向 gateway 的 Hub 输出搓合结果
+
+// MatchResult 匹配成功后生成的结果对象，抛给网关进行开房
+type MatchResult struct {
+	RoomID  string
+	Player1 uint32
+	Player2 uint32
+}
+
+// Matcher 核心匹配引擎结构体
+type Matcher struct {
+	mu       sync.Mutex
+	queue    []uint32         // 正在排队的玩家 ID 列表 (匹配池)
+	ResultCh chan MatchResult // 匹配成功结果的输出管道，交由 Hub 监听
+}
+
+// GlobalMatcher 全局单例匹配引擎
+var GlobalMatcher = &Matcher{
+	queue:    make([]uint32, 0),
+	ResultCh: make(chan MatchResult, 100), // 留足缓冲，防止高并发阻塞
+}
+
+// AddPlayer 将玩家加入匹配队列
+func (m *Matcher) AddPlayer(userID uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// 防抖机制：检查玩家是否已经在队列中，防止狂点匹配
+	for _, id := range m.queue {
+		if id == userID {
+			return
+		}
+	}
+
+	m.queue = append(m.queue, userID)
+	fmt.Printf("🎯 [Matcher] 玩家 %d 加入匹配队列，当前排队人数: %d\n", userID, len(m.queue))
+}
+
+// RemovePlayer 将玩家移出匹配队列 (用于玩家中途取消匹配或突然断线)
+func (m *Matcher) RemovePlayer(userID uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i, id := range m.queue {
+		if id == userID {
+			// 原地安全切割 slice，抹除该玩家
+			m.queue = append(m.queue[:i], m.queue[i+1:]...)
+			fmt.Printf("🚪 [Matcher] 玩家 %d 取消匹配/离开队列\n", userID)
+			break
+		}
+	}
+}
+
+// Start 开启后台搓合协程 (Tick-Based Loop)
+func (m *Matcher) Start() {
+	ticker := time.NewTicker(1 * time.Second) // 1Hz，每秒执行一次匹配判定扫描
+
+	go func() {
+		fmt.Println("⚙️ [Matcher] 独立匹配引擎已启动，正在监听队列...")
+		for range ticker.C {
+			m.mu.Lock()
+
+			// 极简 1v1 匹配机制：只要池子里满 2 个人，立刻发车！
+			// （后期如果要改成 2v2，这里直接改成 >= 4 即可，扩展性极强）
+			if len(m.queue) >= 2 {
+				p1 := m.queue[0]
+				p2 := m.queue[1]
+				m.queue = m.queue[2:] // 把这两个人从排队池里剥离
+
+				// 使用 UUID V4 算法生成全球唯一的房间标识符
+				roomID := uuid.New().String()
+
+				// 将搓合成功的指令推入管道，交给 Gateway 网关去创建真实房间
+				m.ResultCh <- MatchResult{
+					RoomID:  roomID,
+					Player1: p1,
+					Player2: p2,
+				}
+				fmt.Printf("⚔️ [Matcher] 搓合成功！生成决斗空间: %s (P1: %d, P2: %d)\n", roomID, p1, p2)
+			}
+
+			m.mu.Unlock()
+		}
+	}()
 }
 
 --- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\proto\game.pb.go ---
@@ -981,15 +1491,23 @@ const (
 // 定义统一的消息包（替代之前的 GameMessage JSON）
 type GameMessage struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
-	Type    string                 `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`                    // 消息类型: chat, move, init, leave
+	Type    string                 `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`                    // 消息类型: chat, move, init, leave, match_req, match_success
 	UserId  uint32                 `protobuf:"varint,2,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"` // 玩家 ID
 	Content string                 `protobuf:"bytes,3,opt,name=content,proto3" json:"content,omitempty"`              // 聊天内容
 	X       float32                `protobuf:"fixed32,4,opt,name=x,proto3" json:"x,omitempty"`                        // 坐标 X
 	Y       float32                `protobuf:"fixed32,5,opt,name=y,proto3" json:"y,omitempty"`                        // 坐标 Y
 	Z       float32                `protobuf:"fixed32,6,opt,name=z,proto3" json:"z,omitempty"`                        // 坐标 Z
 	// 列表类型：用于同步历史记录或玩家列表
-	Players       []*PlayerPos `protobuf:"bytes,7,rep,name=players,proto3" json:"players,omitempty"`
-	History       []*ChatLog   `protobuf:"bytes,8,rep,name=history,proto3" json:"history,omitempty"`
+	Players []*PlayerPos `protobuf:"bytes,7,rep,name=players,proto3" json:"players,omitempty"`
+	History []*ChatLog   `protobuf:"bytes,8,rep,name=history,proto3" json:"history,omitempty"`
+	// 修改内容：新增基于强类型的房间ID字段
+	// 修改原因：支持基于房间的物理隔离广播与对局，大厅聊天与房间隔离
+	RoomId string `protobuf:"bytes,9,opt,name=room_id,json=roomId,proto3" json:"room_id,omitempty"`
+	// ===== 新增代码 START =====
+	// 修改内容：新增朝向同步字段 rot_y，用于远端玩家丝滑旋转同步与多帧视觉稳定
+	// 修改原因：在 move 类消息中附带 transform.eulerAngles.y，避免远端旋转出现轻微卡顿
+	// 影响范围：仅影响 move/同步类消息；大厅未必填充该字段
+	RotY          float32 `protobuf:"fixed32,10,opt,name=rot_y,json=rotY,proto3" json:"rot_y,omitempty"` // ===== 新增代码 END =====
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1080,12 +1598,27 @@ func (x *GameMessage) GetHistory() []*ChatLog {
 	return nil
 }
 
+func (x *GameMessage) GetRoomId() string {
+	if x != nil {
+		return x.RoomId
+	}
+	return ""
+}
+
+func (x *GameMessage) GetRotY() float32 {
+	if x != nil {
+		return x.RotY
+	}
+	return 0
+}
+
 type PlayerPos struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	UserId        uint32                 `protobuf:"varint,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
 	X             float32                `protobuf:"fixed32,2,opt,name=x,proto3" json:"x,omitempty"`
 	Y             float32                `protobuf:"fixed32,3,opt,name=y,proto3" json:"y,omitempty"`
 	Z             float32                `protobuf:"fixed32,4,opt,name=z,proto3" json:"z,omitempty"`
+	RotY          float32                `protobuf:"fixed32,5,opt,name=rot_y,json=rotY,proto3" json:"rot_y,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1148,6 +1681,13 @@ func (x *PlayerPos) GetZ() float32 {
 	return 0
 }
 
+func (x *PlayerPos) GetRotY() float32 {
+	if x != nil {
+		return x.RotY
+	}
+	return 0
+}
+
 type ChatLog struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Sender        string                 `protobuf:"bytes,1,opt,name=sender,proto3" json:"sender,omitempty"`
@@ -1205,7 +1745,7 @@ var File_game_proto protoreflect.FileDescriptor
 const file_game_proto_rawDesc = "" +
 	"\n" +
 	"\n" +
-	"game.proto\x12\x05proto\"\xd4\x01\n" +
+	"game.proto\x12\x05proto\"\x82\x02\n" +
 	"\vGameMessage\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x17\n" +
 	"\auser_id\x18\x02 \x01(\rR\x06userId\x12\x18\n" +
@@ -1214,12 +1754,16 @@ const file_game_proto_rawDesc = "" +
 	"\x01y\x18\x05 \x01(\x02R\x01y\x12\f\n" +
 	"\x01z\x18\x06 \x01(\x02R\x01z\x12*\n" +
 	"\aplayers\x18\a \x03(\v2\x10.proto.PlayerPosR\aplayers\x12(\n" +
-	"\ahistory\x18\b \x03(\v2\x0e.proto.ChatLogR\ahistory\"N\n" +
+	"\ahistory\x18\b \x03(\v2\x0e.proto.ChatLogR\ahistory\x12\x17\n" +
+	"\aroom_id\x18\t \x01(\tR\x06roomId\x12\x13\n" +
+	"\x05rot_y\x18\n" +
+	" \x01(\x02R\x04rotY\"c\n" +
 	"\tPlayerPos\x12\x17\n" +
 	"\auser_id\x18\x01 \x01(\rR\x06userId\x12\f\n" +
 	"\x01x\x18\x02 \x01(\x02R\x01x\x12\f\n" +
 	"\x01y\x18\x03 \x01(\x02R\x01y\x12\f\n" +
-	"\x01z\x18\x04 \x01(\x02R\x01z\";\n" +
+	"\x01z\x18\x04 \x01(\x02R\x01z\x12\x13\n" +
+	"\x05rot_y\x18\x05 \x01(\x02R\x04rotY\";\n" +
 	"\aChatLog\x12\x16\n" +
 	"\x06sender\x18\x01 \x01(\tR\x06sender\x12\x18\n" +
 	"\acontent\x18\x02 \x01(\tR\acontentB\tZ\a./protob\x06proto3"

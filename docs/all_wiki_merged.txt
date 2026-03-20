@@ -1328,6 +1328,69 @@ Details:
 
 ---
 
+--- WIKI PAGE: 📆-2026.03.17-开发笔记：架构跃迁——拆分三仓库与微服务网关升级.md ---
+
+# 📆 2026.03.17 开发笔记：架构跃迁——拆分三仓库与微服务网关升级
+
+## ✅ 今日核心变革
+
+项目从单体仓库拆分为三个独立的代码仓库，实现职责彻底分离：
+
+1. **React Web 前端大厅**（`asternova-web-client`）  
+2. **Unity 核心战斗引擎**（`MyGameDemo_Client`）  
+3. **Go 微服务后端**（`game-backend-demo`）
+
+---
+
+## 📌 Git 提交信息（按仓库分别提交）
+
+### 1. React Web 前端大厅 (`asternova-web-client`)
+
+```plaintext
+feat(architecture): implement SPA web client with React and Unity WebGL bridge
+
+- 初始化 Next.js + Tailwind + shadcn 现代前端架构。
+- 完成 Login/Register 鉴权模块及 JWT 浏览器持久化。
+- 构建赛博风大厅，实现 Web 端 WebSocket 匹配与职业选择。
+- 集成 react-unity-webgl，实现 WebGL 容器挂载与全屏赛博加载过渡。
+- 建立跨界通信桥梁（The Bridge），成功将对局参数注入 Unity 引擎。
+```
+
+### 2. Unity 核心战斗引擎 (`MyGameDemo_Client`)
+
+```plaintext
+refactor(core): execute 'The Great Decoupling' to strip UI and integrate WebGL
+
+- 彻底移除过时的 UI Toolkit (UXML/USS) 依赖及相关控制器（Login/Lobby Controller）。
+- 重构 GameManager，暴露 `EnterBattle(payload)` 接口供外部 Web 宿主调用。
+- 升级 NetManager 网络入口，新增 `ConnectToArena()`。
+- 支持基于 URL 参数（token, room_id）的 WebSocket 房间直连机制。
+- 将 Unity 引擎定位降级为纯粹的 3D 渲染与战斗同步容器。
+```
+
+### 3. Go 微服务后端 (`game-backend-demo`)
+
+```plaintext
+feat(gateway): upgrade WebSocket hub for dual-protocol (JSON/Protobuf) routing
+
+- 重构网关层消息读写逻辑，实现根据 messageType 的智能分流。
+- 匹配大厅阶段（React端）：全面采用 JSON 文本协议进行握手与搓合推送。
+- 战斗核心阶段（Unity端）：保持高频 Protobuf 二进制协议进行帧同步。
+- 修复 Matcher 搓合成功后的下发格式异常，确保 Web 宿主正确解析 `match_success`。
+```
+
+---
+
+## 🌌 架构跃迁总结（The Great Decoupling）
+
+> **"Reach Beyond the Stars"** —— 这次重构真正实现了质的飞跃。
+
+- **告别 UI 泥潭**：此前（03.13）还在 Unity 中与严苛的 XML 模式、字体挂载、CSS 塌陷作斗争，如今通过 React + Tailwind 一行 `bg-gradient-to-br from-pink-300 to-purple-500` 即可优雅复现渐变色彩体系。
+- **彻底的职责分离**：Unity 不再背负界面负担，退居为纯粹的 60 帧 3D 渲染与战斗同步引擎；React 则接管了完美的 SPA 体验。
+- **双语枢纽诞生**：Go 后端升级为双协议网关，既能用 JSON 与 Web 前端“谈笑风生”，又能用 Protobuf 与 Unity 引擎“硬核同步”，为微服务化打下坚实基础。
+
+---
+
 --- WIKI PAGE: 🗓️2026.02.25-学习笔记.md ---
 
 Welcome to the my-backend-demo wiki!

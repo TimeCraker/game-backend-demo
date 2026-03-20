@@ -1,6 +1,7 @@
 ﻿Folder PATH listing
 Volume serial number is B85E-49CE
 C:.
+|   .cursorrules
 |   .gitignore
 |   docker-compose.yml
 |   go.mod
@@ -8,6 +9,11 @@ C:.
 |   main.go
 |   README.md
 |   
++---.roo
+|   \---rules
+|           backend_rules.md
+|           unity_rules.md
+|           
 +---.wiki.git
 |       #-??-2026.03.03.02-���翪���ʼ�-A.md
 |       #-??-2026.03.03.04-����-�����ʼ�.md
@@ -27,11 +33,10 @@ C:.
 |       ??-2026.03.03.03-���翪���ʼ�B.md
 |       ??-2026.03.04-�����ʼǣ�Unity-�Խ��������޸�.md
 |       ??-2026.03.08-�����ʼ�.md
+|       ??-2026.03.17-�����ʼǣ��ܹ�ԾǨ����������ֿ���΢������������.md
 |       ???2026.02.25-ѧϰ�ʼ�.md
 |       
 +---docs
-|       all_code_merged.txt
-|       all_wiki_merged.txt
 |       project_tree.txt
 |       roadmap.md
 |       
@@ -44,6 +49,8 @@ C:.
 |       
 +---services
 |   +---auth
+|   |   |   main.go
+|   |   |   
 |   |   +---db
 |   |   |       mysql.go
 |   |   |       redis.go
@@ -75,7 +82,10 @@ C:.
 |   |           websocket.go
 |   |           
 |   +---match
+|   |       matcher.go
+|   |       
 |   \---proto
+|           Game.cs
 |           game.pb.go
 |           game.proto
 |           

@@ -1,52 +1,57 @@
-// --- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\main.go ---
-
 package main
 
 import (
 	"log"
+	"net/http"
 
 	"github.com/TimeCraker/game-backend-demo/services/auth/db"
 	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/account"
 	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/send_email"
 	"github.com/TimeCraker/game-backend-demo/services/auth/middleware"
-
-	// 引入 gateway 服务的 handlers 包，使用 gw_handlers 别名
-	gw_handlers "github.com/TimeCraker/game-backend-demo/services/gateway/handlers"
-
-	// 引入 match 匹配引擎服务
-	// 修改内容：新增匹配引擎包导入
-	// 修改原因：在主服务中启动独立匹配引擎循环
+	// 引入 gateway 服务的 handlers 包，使用 handlers 别名（网关 WebSocket + GlobalHub）
+	handlers "github.com/TimeCraker/game-backend-demo/services/gateway/handlers"
+	// 引入 match 匹配引擎服务：在主进程中启动 Tick 撮合循环，与网关解耦
 	"github.com/TimeCraker/game-backend-demo/services/match"
-
 	"github.com/gin-gonic/gin"
 )
 
 func main() {
 	// --- 数据库模块初始化 ---
+	// 修改内容：在 main 最前初始化 MySQL / Redis
+	// 修改原因：后续 account、验证码、会话等均依赖全局 db 客户端
+	// 影响范围：进程级，所有 HTTP / WS 处理链路
 	db.InitMySQL()
 	db.InitRedis()
+
+	// --- 后台守护：匹配引擎 + 网关监听（动态创建物理房间）---
+	// 修改内容：拉起 GlobalMatcher（1Hz）与 GlobalHub.ListenMatchResults
+	// 修改原因：撮合结果经 ResultCh 送达 Hub，驱动开房与 match_success 下发
+	// 影响范围：匹配队列、房间表、WebSocket 推送
+	log.Println("⚙️ 正在启动独立匹配引擎 Matcher...")
+	match.GlobalMatcher.Start()
+	log.Println("⚙️ 正在启动网关枢纽 ListenMatchResults...")
+	handlers.GlobalHub.ListenMatchResults()
 
 	// --- 启动 Gin 引擎 ---
 	r := gin.Default()
 
-
-	// 修改内容：增加全局 CORS 跨域中间件
-	// 修改原因：支持前后端分离架构下，React 前端 (localhost:3000) 发起的 OPTIONS 预检请求与 POST 请求
+	// ===== 新增代码 START =====
+	// 修改内容：全局 CORS 中间件改为允许任意 Origin / Method / Header（通配 *）
+	// 修改原因：Next.js 与 Unity WebGL 等多端联调时减少预检失败；与原先「列举常用 Header」等价或更宽
+	// 影响范围：所有 HTTP 路由（含 /api、/api/v1、/health）
 	r.Use(func(c *gin.Context) {
-		// 允许你的前端地址跨域（开发环境可以先写 "*"，或者严格写明你的前端地址）
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
-
-		// 拦截 OPTIONS 预检请求，直接返回 204 无内容状态码
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
+		h := c.Writer.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Allow-Methods", "*")
+		h.Set("Access-Control-Allow-Headers", "*")
+		h.Set("Access-Control-Expose-Headers", "*")
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
-
 		c.Next()
 	})
+	// ===== 新增代码 END =====
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{
@@ -56,18 +61,34 @@ func main() {
 		})
 	})
 
-	// --- 路由注册 ---
-	// 将基础功能统一放入 v1 组中管理
+	// ===== 新增代码 START =====
+	// 修改内容：对外统一 REST 前缀 /api（与产品文档一致）
+	// 修改原因：与任务要求的 /api/register、/api/login、/api/send-code、/api/me 对齐
+	// 影响范围：新接入的客户端可直接走 /api/*
+	api := r.Group("/api")
+	{
+		api.POST("/register", account.Register)
+		api.POST("/login", account.Login)
+		api.POST("/send-code", send_email.SendEmailCode)
+
+		authz := api.Group("")
+		authz.Use(middleware.AuthMiddleware())
+		authz.GET("/me", account.GetMe)
+	}
+	// ===== 新增代码 END =====
+
+	// --- 路由注册：v1 兼容层（现有 Next.js rewrite 仍指向 /api/v1/*）---
+	// 修改内容：保留 send_code 路径与 profile 示例接口
+	// 修改原因：next.config rewrites：/api/proxy → http://127.0.0.1:8081/api/v1/:path*
+	// 影响范围：asternova-web-client 当前登录/注册/验证码请求
 	v1 := r.Group("/api/v1")
 	{
-
-		// 修改内容：修正路由绑定的 Handler 名称，指向真实存在的函数
-		// 修改原因：解决 undefined: send_email.SendCodeHandler / account.RegisterHandler / account.LoginHandler 的编译错误
+		// 修正路由绑定的 Handler 名称，指向真实存在的函数
 		v1.POST("/send_code", send_email.SendEmailCode)
 		v1.POST("/register", account.Register)
 		v1.POST("/login", account.Login)
 
-		// 需要鉴权的路由示例：/api/v1/profile
+		// 需要鉴权的路由示例：/api/v1/profile（返回结构与 /api/me 不同，保留兼容）
 		v1.GET("/profile", middleware.AuthMiddleware(), func(c *gin.Context) {
 			userID, _ := c.Get("userID")
 			c.JSON(200, gin.H{
@@ -77,17 +98,11 @@ func main() {
 		})
 	}
 
-	// 注入 Gateway 模块的长连接路由 (挂载在 /ws)
-	r.GET("/ws", gw_handlers.HandleWS())
+	// 注入 Gateway 模块的长连接路由（大厅 / 战斗统一入口）
+	r.GET("/ws", handlers.HandleWS())
 
-	// 修改内容：在此处正式拉起匹配引擎循环与网关监听
-	// 修改原因：赋予服务器撮合玩家开房对战的核心驱动力
-	log.Println("⚙️ 正在启动独立匹配引擎 Matcher...")
-	match.GlobalMatcher.Start()
-	log.Println("⚙️ 正在启动网关枢纽监听...")
-	gw_handlers.GlobalHub.ListenMatchResults()
-
-	// 启动服务器
-	log.Println("🚀 Game Auth Server 启动于 :8081")
-	r.Run(":8081")
+	log.Println("🚀 Game Auth + Gateway 启动于 :8081（REST /api、/api/v1，WS /ws）")
+	if err := r.Run(":8081"); err != nil {
+		log.Fatalf("❌ 服务启动失败: %v", err)
+	}
 }

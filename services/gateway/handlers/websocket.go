@@ -56,6 +56,39 @@ func HandleWS() gin.HandlerFunc {
 		userID := int(claims.UserID)
 		log.Printf("✅ 玩家 %d 请求建立 WebSocket 连接...", userID)
 
+		// roomId（camelCase）为主，兼容旧版 room_id
+		roomID := c.Query("roomId")
+		if roomID == "" {
+			roomID = c.Query("room_id")
+		}
+
+		// scope：用于显式区分连接语义（lobby/battle）
+		// 方案 A：推荐前端显式传 scope；为兼容旧调用，这里保留在 scope 缺失时基于 roomID 推断。
+		scope := c.Query("scope")
+		if scope == "" {
+			if roomID != "" {
+				scope = "battle"
+			} else {
+				scope = "lobby"
+			}
+		}
+
+		switch scope {
+		case "lobby":
+			log.Printf("🧭 玩家 %d 建立大厅 WS（scope=lobby）", userID)
+		case "battle":
+			if roomID == "" {
+				log.Printf("❌ 拒绝连接：battle scope 但缺少 roomId，user=%d", userID)
+				c.JSON(http.StatusBadRequest, gin.H{"error": "battle scope requires roomId"})
+				return
+			}
+			log.Printf("🧭 玩家 %d 建立战斗 WS（scope=battle, roomId=%s）", userID, roomID)
+		default:
+			log.Printf("❌ 拒绝连接：未知 scope=%s，user=%d", scope, userID)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid scope"})
+			return
+		}
+
 		// --- 🟡 第二步：升级协议为 WebSocket (Upgrade) ---
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
@@ -63,15 +96,26 @@ func HandleWS() gin.HandlerFunc {
 			return
 		}
 
+		var battleClient *Client
+
 		// --- 🔵 第三步：注册玩家并初始化状态 (Initialization) ---
-		GlobalHub.Register(userID, conn)
-		log.Printf("🎉 玩家 %d 已成功加入 GlobalHub", userID)
-
-		// 发送当前所有在线玩家的位置数据给新登入的玩家
-		sendInitialPlayersData(conn)
-
-		// 广播给全服，有新人加入了
-		broadcastNewPlayerJoin(userID)
+		// battle 连接不进入 GlobalHub.Clients，避免大厅广播误伤战斗帧
+		if scope == "lobby" {
+			GlobalHub.Register(userID, conn)
+			log.Printf("🎉 玩家 %d 已成功加入 GlobalHub", userID)
+			sendInitialPlayersData(conn)
+			broadcastNewPlayerJoin(userID)
+		} else {
+			if !GlobalHub.RoomHasUser(roomID, userID) {
+				log.Printf("❌ 玩家 %d 尝试加入非法房间 roomId=%s，已拒绝", userID, roomID)
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"非法房间"}`))
+				_ = conn.Close()
+				return
+			}
+			battleClient = &Client{UserID: userID, Conn: conn}
+			GlobalHub.JoinRoom(battleClient, roomID)
+			log.Printf("🏠 玩家 %d 已加入 Hub.Rooms roomId=%s", userID, roomID)
+		}
 
 		// --- 心跳机制 (Ping/Pong) ---
 		conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -95,20 +139,26 @@ func HandleWS() gin.HandlerFunc {
 		for {
 			messageType, message, err := conn.ReadMessage()
 			if err != nil {
-				log.Printf("⚠️ 玩家 %d 断开连接: %v", userID, err)
-				GlobalHub.Unregister(userID)
+				log.Printf("⚠️ 玩家 %d 断开连接 (roomId=%s): %v", userID, roomID, err)
 
 				// 如果意外断线，顺手从匹配池中移除该玩家，防挂机
 				match.GlobalMatcher.RemovePlayer(uint32(userID))
 
-				broadcastPlayerLeave(userID)
+				if battleClient != nil {
+					GlobalHub.LeaveRoom(battleClient)
+					log.Printf("🏚️ 玩家 %d 已离开 Hub.Rooms roomId=%s", userID, roomID)
+				} else {
+					GlobalHub.Unregister(userID)
+					broadcastPlayerLeave(userID)
+				}
 				break
 			}
 
-			// ===== 新增代码 START =====
-			// 修改内容：根据 messageType 分流解析 Text(JSON) / Binary(Protobuf)
-			// 修改原因：兼容 React 前端 JSON 文本消息与 Unity Protobuf 二进制消息的双端分离架构
-			// ===== 新增代码 END =====
+			// 方案 A：battle 连接所有消息只转发到房间，不走大厅逻辑
+			if scope == "battle" {
+				GlobalHub.BroadcastToRoom(roomID, messageType, message)
+				continue
+			}
 
 			// 解析前端/客户端发来的消息（Text -> JSON；Binary -> Protobuf）
 			var msg pb.GameMessage
@@ -132,13 +182,6 @@ func HandleWS() gin.HandlerFunc {
 			if msg.Type == "match_req" {
 				match.GlobalMatcher.AddPlayer(uint32(userID))
 				continue // 处理完毕，阻断后续逻辑
-			}
-
-			// 拦截 2：房间内消息隔离 (只要带有 room_id 并且不是大厅的世界聊天)
-			if msg.RoomId != "" && msg.Type != "chat" {
-				// 直接在房间内广播二进制原包，不再存入任何数据库！性能起飞！
-				GlobalHub.BroadcastToRoom(msg.RoomId, message)
-				continue
 			}
 
 			// --- 如果没有被拦截，说明是大厅全局消息，走传统分流逻辑 ---
@@ -165,6 +208,7 @@ func sendInitialPlayersData(conn *websocket.Conn) {
 				X:      float32(pos.X),
 				Y:      float32(pos.Y),
 				Z:      float32(pos.Z),
+				RotY:   0,
 			})
 		}
 		return true
@@ -239,6 +283,7 @@ func broadcastNewPlayerJoin(userID int) {
 					X:      float32(pos.X),
 					Y:      float32(pos.Y),
 					Z:      float32(pos.Z),
+					RotY:   0,
 				},
 			},
 		}
