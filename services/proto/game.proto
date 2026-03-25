@@ -26,6 +26,16 @@ message GameMessage {
     // 修改原因：在 move 类消息中附带 transform.eulerAngles.y，避免远端旋转出现轻微卡顿
     // 影响范围：仅影响 move/同步类消息；大厅未必填充该字段
     float rot_y = 10;
+
+    // 修改内容：新增客户端输入同步字段（服务端权威接管所需）
+    // 修改原因：将客户端输入上行给服务端，由服务端统一推进状态与广播快照
+    // 影响范围：battle 场景输入消息；其他消息类型可保持默认零值
+    float input_x = 11;
+    float input_y = 12;
+    bool is_charging = 13;
+    bool is_attacking = 14;
+    float mouse_x = 15;
+    float mouse_y = 16;
     // ===== 新增代码 END =====
 }
 
@@ -35,6 +45,13 @@ message PlayerPos {
     float y = 3;
     float z = 4;
     float rot_y = 5;
+
+    // 修改内容：新增服务端状态快照字段
+    // 修改原因：服务端需要将玩家状态机状态、生命值、能量值下行给客户端
+    // 影响范围：state 类型广播与战斗 HUD 同步
+    uint32 current_state = 6;
+    int32 hp = 7;
+    int32 energy = 8;
 }
 
 message ChatLog {

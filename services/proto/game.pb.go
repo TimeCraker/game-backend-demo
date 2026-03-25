@@ -42,7 +42,16 @@ type GameMessage struct {
 	// 修改内容：新增朝向同步字段 rot_y，用于远端玩家丝滑旋转同步与多帧视觉稳定
 	// 修改原因：在 move 类消息中附带 transform.eulerAngles.y，避免远端旋转出现轻微卡顿
 	// 影响范围：仅影响 move/同步类消息；大厅未必填充该字段
-	RotY          float32 `protobuf:"fixed32,10,opt,name=rot_y,json=rotY,proto3" json:"rot_y,omitempty"` // ===== 新增代码 END =====
+	RotY float32 `protobuf:"fixed32,10,opt,name=rot_y,json=rotY,proto3" json:"rot_y,omitempty"`
+	// 修改内容：新增客户端输入同步字段（服务端权威接管所需）
+	// 修改原因：将客户端输入上行给服务端，由服务端统一推进状态与广播快照
+	// 影响范围：battle 场景输入消息；其他消息类型可保持默认零值
+	InputX        float32 `protobuf:"fixed32,11,opt,name=input_x,json=inputX,proto3" json:"input_x,omitempty"`
+	InputY        float32 `protobuf:"fixed32,12,opt,name=input_y,json=inputY,proto3" json:"input_y,omitempty"`
+	IsCharging    bool    `protobuf:"varint,13,opt,name=is_charging,json=isCharging,proto3" json:"is_charging,omitempty"`
+	IsAttacking   bool    `protobuf:"varint,14,opt,name=is_attacking,json=isAttacking,proto3" json:"is_attacking,omitempty"`
+	MouseX        float32 `protobuf:"fixed32,15,opt,name=mouse_x,json=mouseX,proto3" json:"mouse_x,omitempty"`
+	MouseY        float32 `protobuf:"fixed32,16,opt,name=mouse_y,json=mouseY,proto3" json:"mouse_y,omitempty"` // ===== 新增代码 END =====
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -147,13 +156,61 @@ func (x *GameMessage) GetRotY() float32 {
 	return 0
 }
 
+func (x *GameMessage) GetInputX() float32 {
+	if x != nil {
+		return x.InputX
+	}
+	return 0
+}
+
+func (x *GameMessage) GetInputY() float32 {
+	if x != nil {
+		return x.InputY
+	}
+	return 0
+}
+
+func (x *GameMessage) GetIsCharging() bool {
+	if x != nil {
+		return x.IsCharging
+	}
+	return false
+}
+
+func (x *GameMessage) GetIsAttacking() bool {
+	if x != nil {
+		return x.IsAttacking
+	}
+	return false
+}
+
+func (x *GameMessage) GetMouseX() float32 {
+	if x != nil {
+		return x.MouseX
+	}
+	return 0
+}
+
+func (x *GameMessage) GetMouseY() float32 {
+	if x != nil {
+		return x.MouseY
+	}
+	return 0
+}
+
 type PlayerPos struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	UserId        uint32                 `protobuf:"varint,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
-	X             float32                `protobuf:"fixed32,2,opt,name=x,proto3" json:"x,omitempty"`
-	Y             float32                `protobuf:"fixed32,3,opt,name=y,proto3" json:"y,omitempty"`
-	Z             float32                `protobuf:"fixed32,4,opt,name=z,proto3" json:"z,omitempty"`
-	RotY          float32                `protobuf:"fixed32,5,opt,name=rot_y,json=rotY,proto3" json:"rot_y,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	UserId uint32                 `protobuf:"varint,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	X      float32                `protobuf:"fixed32,2,opt,name=x,proto3" json:"x,omitempty"`
+	Y      float32                `protobuf:"fixed32,3,opt,name=y,proto3" json:"y,omitempty"`
+	Z      float32                `protobuf:"fixed32,4,opt,name=z,proto3" json:"z,omitempty"`
+	RotY   float32                `protobuf:"fixed32,5,opt,name=rot_y,json=rotY,proto3" json:"rot_y,omitempty"`
+	// 修改内容：新增服务端状态快照字段
+	// 修改原因：服务端需要将玩家状态机状态、生命值、能量值下行给客户端
+	// 影响范围：state 类型广播与战斗 HUD 同步
+	CurrentState  uint32 `protobuf:"varint,6,opt,name=current_state,json=currentState,proto3" json:"current_state,omitempty"`
+	Hp            int32  `protobuf:"varint,7,opt,name=hp,proto3" json:"hp,omitempty"`
+	Energy        int32  `protobuf:"varint,8,opt,name=energy,proto3" json:"energy,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -223,6 +280,27 @@ func (x *PlayerPos) GetRotY() float32 {
 	return 0
 }
 
+func (x *PlayerPos) GetCurrentState() uint32 {
+	if x != nil {
+		return x.CurrentState
+	}
+	return 0
+}
+
+func (x *PlayerPos) GetHp() int32 {
+	if x != nil {
+		return x.Hp
+	}
+	return 0
+}
+
+func (x *PlayerPos) GetEnergy() int32 {
+	if x != nil {
+		return x.Energy
+	}
+	return 0
+}
+
 type ChatLog struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Sender        string                 `protobuf:"bytes,1,opt,name=sender,proto3" json:"sender,omitempty"`
@@ -280,7 +358,7 @@ var File_game_proto protoreflect.FileDescriptor
 const file_game_proto_rawDesc = "" +
 	"\n" +
 	"\n" +
-	"game.proto\x12\x05proto\"\x82\x02\n" +
+	"game.proto\x12\x05proto\"\xaa\x03\n" +
 	"\vGameMessage\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x17\n" +
 	"\auser_id\x18\x02 \x01(\rR\x06userId\x12\x18\n" +
@@ -292,13 +370,23 @@ const file_game_proto_rawDesc = "" +
 	"\ahistory\x18\b \x03(\v2\x0e.proto.ChatLogR\ahistory\x12\x17\n" +
 	"\aroom_id\x18\t \x01(\tR\x06roomId\x12\x13\n" +
 	"\x05rot_y\x18\n" +
-	" \x01(\x02R\x04rotY\"c\n" +
+	" \x01(\x02R\x04rotY\x12\x17\n" +
+	"\ainput_x\x18\v \x01(\x02R\x06inputX\x12\x17\n" +
+	"\ainput_y\x18\f \x01(\x02R\x06inputY\x12\x1f\n" +
+	"\vis_charging\x18\r \x01(\bR\n" +
+	"isCharging\x12!\n" +
+	"\fis_attacking\x18\x0e \x01(\bR\visAttacking\x12\x17\n" +
+	"\amouse_x\x18\x0f \x01(\x02R\x06mouseX\x12\x17\n" +
+	"\amouse_y\x18\x10 \x01(\x02R\x06mouseY\"\xb0\x01\n" +
 	"\tPlayerPos\x12\x17\n" +
 	"\auser_id\x18\x01 \x01(\rR\x06userId\x12\f\n" +
 	"\x01x\x18\x02 \x01(\x02R\x01x\x12\f\n" +
 	"\x01y\x18\x03 \x01(\x02R\x01y\x12\f\n" +
 	"\x01z\x18\x04 \x01(\x02R\x01z\x12\x13\n" +
-	"\x05rot_y\x18\x05 \x01(\x02R\x04rotY\";\n" +
+	"\x05rot_y\x18\x05 \x01(\x02R\x04rotY\x12#\n" +
+	"\rcurrent_state\x18\x06 \x01(\rR\fcurrentState\x12\x0e\n" +
+	"\x02hp\x18\a \x01(\x05R\x02hp\x12\x16\n" +
+	"\x06energy\x18\b \x01(\x05R\x06energy\";\n" +
 	"\aChatLog\x12\x16\n" +
 	"\x06sender\x18\x01 \x01(\tR\x06sender\x12\x18\n" +
 	"\acontent\x18\x02 \x01(\tR\acontentB\tZ\a./protob\x06proto3"

@@ -4,6 +4,7 @@ C:.
 |   .cursorrules
 |   .gitignore
 |   docker-compose.yml
+|   game-backend-demo.exe
 |   go.mod
 |   go.sum
 |   main.go
@@ -37,8 +38,11 @@ C:.
 |       ???2026.02.25-ѧϰ�ʼ�.md
 |       
 +---docs
+|       all_wiki_merged.txt
 |       project_tree.txt
 |       roadmap.md
+|       ���-all_code_merged.txt
+|       ���-project_tree.txt
 |       
 +---scripts
 |       generate_docs.ps1
