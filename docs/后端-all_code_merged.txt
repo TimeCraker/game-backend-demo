@@ -110,70 +110,6 @@ func main() {
 	}
 }
 
---- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\main.go ---
-
-package main
-
-import (
-	"log"
-
-	"github.com/TimeCraker/game-backend-demo/services/auth/db"
-	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/account"
-	"github.com/TimeCraker/game-backend-demo/services/auth/handlers/send_email"
-	"github.com/TimeCraker/game-backend-demo/services/auth/middleware"
-
-	"github.com/gin-gonic/gin"
-)
-
-func main() {
-	// --- 数据库模块初始化 ---
-	db.InitMySQL()
-	db.InitRedis()
-	// --- 启动 Gin 引擎 ---
-	r := gin.Default()
-
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"status": "up",
-			"mysql":  "connected",
-			"redis":  "connected",
-		})
-	})
-
-	// --- 路由注册 ---
-
-	// 根据你的建议，将基础功能统一放入 v1 组中管理
-	v1 := r.Group("/api/v1")
-	{
-		// 基础账号功能（注册、登录）
-
-		// 更新路由绑定，使用新的包名前缀
-		v1.POST("/register", account.Register)
-		v1.POST("/login", account.Login)
-		// 新增：邮箱验证码接口
-		v1.POST("/send-code", send_email.SendEmailCode)
-
-	}
-
-	// 原有的认证组功能
-	api := r.Group("/api")
-
-	// 更新中间件和路由绑定
-	api.Use(middleware.AuthMiddleware())
-	{
-		// 只有带 Token 的请求才能访问 /api/me
-		api.GET("/me", account.GetMe)
-	}
-
-	// WebSocket 入口
-	// 更新 WebSocket 路由绑定
-	// --- 5. 跑起来！ ---
-	log.Println("👾 游戏认证后端已在 :8081 启动")
-	if err := r.Run(":8081"); err != nil {
-		log.Fatalf("❌ 服务启动失败: %v", err)
-	}
-}
-
 --- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\db\mysql.go ---
 
 package db
@@ -826,6 +762,743 @@ func ParseToken(tokenString string) (*Claims, error) {
 	return claims, nil
 }
 
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\battle\math.go ---
+
+package battle
+
+import "math"
+
+// ===== 新增代码 START =====
+// 修改内容：定义战斗平面 Vector2 数学结构与基础运算
+// 修改原因：服务端需要与 Godot 侧一致的向量运算语义来复刻移动/刹车逻辑
+// 影响范围：battle 玩家物理推进、插值与速度逼近算法
+type Vector2 struct {
+	X float64
+	Z float64
+}
+
+// Add 向量加法。
+func (v Vector2) Add(other Vector2) Vector2 {
+	return Vector2{X: v.X + other.X, Z: v.Z + other.Z}
+}
+
+// Sub 向量减法。
+func (v Vector2) Sub(other Vector2) Vector2 {
+	return Vector2{X: v.X - other.X, Z: v.Z - other.Z}
+}
+
+// Mul 标量乘法。
+func (v Vector2) Mul(scalar float64) Vector2 {
+	return Vector2{X: v.X * scalar, Z: v.Z * scalar}
+}
+
+// Length 返回向量长度。
+func (v Vector2) Length() float64 {
+	return math.Sqrt(v.X*v.X + v.Z*v.Z)
+}
+
+// Normalized 返回归一化向量（零向量返回零向量）。
+func (v Vector2) Normalized() Vector2 {
+	l := v.Length()
+	if l <= 0 {
+		return Vector2{}
+	}
+	return Vector2{X: v.X / l, Z: v.Z / l}
+}
+
+// Dot 返回点积。
+func (v Vector2) Dot(other Vector2) float64 {
+	return v.X*other.X + v.Z*other.Z
+}
+
+// Lerp 线性插值（对标 Godot 的 v + (target - v) * weight）。
+func (v Vector2) Lerp(target Vector2, weight float64) Vector2 {
+	return Vector2{
+		X: v.X + (target.X-v.X)*weight,
+		Z: v.Z + (target.Z-v.Z)*weight,
+	}
+}
+
+// MoveToward 向目标最多移动 maxDelta（对标 Godot move_toward）。
+func (v Vector2) MoveToward(target Vector2, maxDelta float64) Vector2 {
+	delta := target.Sub(v)
+	dist := delta.Length()
+	if dist <= maxDelta || dist == 0 {
+		return target
+	}
+	return v.Add(delta.Mul(maxDelta / dist))
+}
+
+// ===== 新增代码 END =====
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\battle\player_state.go ---
+
+package battle
+
+import "math"
+
+// ===== 新增代码 START =====
+// 修改内容：定义战斗物理层常量参数（服务端权威推进的基础配置）
+// 修改原因：统一服务端速度、蓄力、阻尼等关键参数，避免魔法数字散落
+// 影响范围：battle 服务内的物理更新与状态结算（后续 updatePhysics 使用）
+const (
+	// 移动与物理参数
+	BaseSpeed              = 200.0
+	ChargeSpeedMultiplier  = 0.3
+	MaxChargeTime          = 3.5
+	MaxEffectiveChargeTime = 2.5
+	AccelTime              = 1.33
+	DashFriction           = 18.0
+	HitStunFriction        = 8.0
+	DashDistMultiplier     = 1.5
+
+	// 战斗与状态时间参数 (秒)
+	DashDuration           = 0.3 // 冲刺持续时间
+	DashPostCast           = 0.5 // 冲刺结束后的后摇
+	AttackPreCast          = 0.1 // 攻击前摇
+	AttackDuration         = 0.05 // 攻击判定窗口
+	AttackPostCastMiss     = 0.5 // 攻击挥空后摇惩罚
+	AttackPostCastHit      = 0.3 // 攻击命中后摇奖励
+	HitStunNormal          = 0.4 // 普通受击硬直
+	HitStunClash           = 0.5 // 拼刀受击硬直
+
+	// 判定与数值参数
+	MeleeRadius            = 150.0 // 扇形攻击判定半径
+	DashHitRadius          = 60.0  // 冲刺碰撞半径
+	KnockbackSpeed         = 1600.0 // 击退初速度
+	BaseDamage       int32 = 30    // 基础伤害
+	EnergyReward     int32 = 1     // 命中回复能量
+)
+
+// State 表示玩家在战斗状态机中的离散状态枚举（与协议中的 current_state 对齐使用）
+type State uint32
+
+const (
+	// Idle：静止待机状态
+	Idle State = iota
+	// Move：常规移动状态
+	Move
+	// Charging：蓄力状态
+	Charging
+	// Dashing：冲刺/突进状态
+	Dashing
+	// Attack：普通攻击状态
+	Attack
+	// PreCast：技能前摇状态
+	PreCast
+	// PostCast：技能后摇状态
+	PostCast
+	// HitStun：受击硬直状态
+	HitStun
+	// SkillCast：技能释放状态
+	SkillCast
+	// Dead：死亡状态
+	Dead
+)
+
+// InputSnapshot 缓存最近一帧客户端输入，用于固定帧中推进权威逻辑。
+type InputSnapshot struct {
+	// InputX/InputY：归一化平面输入（通常来自摇杆或 WASD）
+	InputX float64
+	InputY float64
+	// IsCharging/IsAttacking：动作按键状态
+	IsCharging  bool
+	IsAttacking bool
+	// MouseX/MouseY：瞄准点或鼠标朝向输入
+	MouseX float64
+	MouseY float64
+}
+
+// BattlePlayer 表示战斗房间内由服务端权威管理的玩家运行时状态。
+type BattlePlayer struct {
+	// UserID：玩家唯一标识，对应协议 user_id
+	UserID uint32
+	// Position：XZ 平面权威位置（Y 轴独立保存）
+	Position Vector2
+	// Y：独立高度坐标（当前 2D 战斗可保持 0）
+	Y float64
+	// RotY：角色朝向（角度）
+	RotY float64
+	// Velocity：XZ 平面的瞬时速度
+	Velocity Vector2
+	// FacingX：水平朝向，仅存 1.0 或 -1.0
+	FacingX float64
+	// CurrentState：当前状态机状态（下行同步到 current_state）
+	CurrentState State
+	// HP/Energy：战斗核心属性（下行同步到 hp/energy）
+	HP     int32
+	Energy int32
+	// StateTimer：状态机计时器（替代 Godot create_timer）
+	StateTimer float64
+	// ChargeTimer：当前蓄力累计时间（秒）
+	ChargeTimer float64
+	// HasHit：当前攻击/冲刺阶段是否已经触发过命中
+	HasHit bool
+	// Input：最近一次收到的输入快照
+	Input InputSnapshot
+	// ClassID：角色职业（如 Role1_Speedster），用于大招补丁分发
+	ClassID string
+	// SpeedsterBuffTimer：极速者大招 Buff 倒计时（蓄力加速、取消后摇、停能量等）
+	SpeedsterBuffTimer float64
+}
+
+// Update 在单个 fixed-tick 内推进玩家状态机与物理。
+func (p *BattlePlayer) Update(delta float64) {
+	if p.SpeedsterBuffTimer > 0 {
+		p.SpeedsterBuffTimer -= delta
+	}
+	// 修改内容：先推进计时状态机，严格复刻 PreCast->Attack->PostCast->Idle 时间链
+	// 修改原因：Go 端无 create_timer，需要用显式倒计时保证服务端权威一致性
+	// 影响范围：攻击前后摇、受击硬直等离散动作状态切换
+	if p.StateTimer > 0 {
+		p.StateTimer -= delta
+	}
+	if p.StateTimer <= 0 {
+		switch p.CurrentState {
+		case PreCast:
+			p.CurrentState = Attack
+			p.HasHit = false
+			p.StateTimer = AttackDuration
+		case Attack:
+			if p.SpeedsterBuffTimer > 0 {
+				p.CurrentState = Idle // 极速者大招：完全取消攻击后摇
+				p.StateTimer = 0
+			} else {
+				p.CurrentState = PostCast
+				if p.HasHit {
+					p.StateTimer = AttackPostCastHit
+				} else {
+					p.StateTimer = AttackPostCastMiss
+				}
+			}
+		case Dashing:
+			if p.SpeedsterBuffTimer > 0 {
+				p.CurrentState = Idle // 极速者大招：完全取消冲刺后摇
+				p.StateTimer = 0
+			} else {
+				p.CurrentState = PostCast
+				p.StateTimer = DashPostCast
+			}
+		case PostCast, HitStun, SkillCast:
+			p.CurrentState = Idle
+			p.StateTimer = 0
+		}
+	}
+
+	// 由输入触发攻击（仅可移动状态可进入前摇）。
+	if p.Input.IsAttacking && (p.CurrentState == Idle || p.CurrentState == Move || p.CurrentState == Charging) {
+		p.CurrentState = PreCast
+		p.StateTimer = AttackPreCast
+	}
+
+	inputVec := Vector2{X: p.Input.InputX, Z: p.Input.InputY}
+	inputDir := inputVec.Normalized()
+
+	if p.Input.IsCharging {
+		dx := p.Input.MouseX - p.Position.X
+		if dx > 0 {
+			p.FacingX = 1.0
+		} else if dx < 0 {
+			p.FacingX = -1.0
+		}
+	}
+
+	// 蓄力状态机：按住进入 Charging，松开从 Charging 进入 Dashing。
+	if p.CurrentState == Idle || p.CurrentState == Move || p.CurrentState == Charging {
+		if p.Input.IsCharging {
+			p.CurrentState = Charging
+			chargeRate := 1.0
+			if p.SpeedsterBuffTimer > 0 {
+				chargeRate = 1.5 // 极速者大招期间蓄力速度提升 1.5 倍
+			}
+			p.ChargeTimer += delta * chargeRate
+			if p.ChargeTimer >= MaxChargeTime {
+				p.startDashFromCharge()
+			}
+		} else if p.CurrentState == Charging {
+			p.startDashFromCharge()
+		} else if inputDir.Length() > 0 {
+			p.CurrentState = Move
+		} else {
+			p.CurrentState = Idle
+		}
+	}
+
+	if !p.Input.IsCharging && p.CurrentState == Move && p.Input.InputX != 0 {
+		if p.Input.InputX > 0 {
+			p.FacingX = 1.0
+		} else {
+			p.FacingX = -1.0
+		}
+	}
+
+	// 非可移动状态不吃普通位移输入。
+	if !(p.CurrentState == Idle || p.CurrentState == Move || p.CurrentState == Charging || p.CurrentState == Dashing) {
+		inputDir = Vector2{}
+	}
+
+	// 物理三轨制：
+	// 轨道 A1：受击与死亡（台球级顺滑刹车）
+	if p.CurrentState == HitStun || p.CurrentState == Dead {
+		p.Velocity = p.Velocity.Lerp(Vector2{}, HitStunFriction*delta)
+	} else if p.CurrentState == SkillCast {
+		p.Velocity = p.Velocity.Lerp(Vector2{}, DashFriction*delta)
+	} else if p.CurrentState == Dashing {
+		// 轨道 A2：冲刺（极速急停）；结束时机由 StateTimer 驱动，见 Dashing 分支
+		p.Velocity = p.Velocity.Lerp(Vector2{}, DashFriction*delta)
+	} else {
+		currentMaxSpeed := BaseSpeed
+		if p.CurrentState == Charging {
+			currentMaxSpeed = BaseSpeed * ChargeSpeedMultiplier
+		}
+
+		targetVelocity := inputDir.Mul(currentMaxSpeed)
+		accelStep := (BaseSpeed / AccelTime) * delta
+
+		var linearTarget Vector2
+		if inputDir.Length() == 0 {
+			linearTarget = p.Velocity.MoveToward(Vector2{}, accelStep)
+		} else {
+			if p.Velocity.Length() > 0 && inputDir.Dot(p.Velocity.Normalized()) < 0 {
+				// 输入反向时采用 4 倍制动，加快掉头响应（对标 Godot 逻辑）。
+				accelStep *= 4.0
+			}
+			linearTarget = p.Velocity.MoveToward(targetVelocity, accelStep)
+		}
+		p.Velocity = p.Velocity.Lerp(linearTarget, 25.0*delta)
+	}
+
+	// 应用位移积分（XZ 平面）。
+	p.Position.X += p.Velocity.X * delta
+	p.Position.Z += p.Velocity.Z * delta
+
+	// 使用输入鼠标向量更新朝向（与客户端鼠标控制语义保持一致）。
+	dirToMouse := Vector2{X: p.Input.MouseX - p.Position.X, Z: p.Input.MouseY - p.Position.Z}
+	if dirToMouse.Length() > 0.001 {
+		p.RotY = math.Atan2(dirToMouse.Z, dirToMouse.X) * 180.0 / math.Pi
+	}
+
+}
+
+// startDashFromCharge 按蓄力时间转换冲刺初速度。
+func (p *BattlePlayer) startDashFromCharge() {
+	effectiveTime := math.Min(p.ChargeTimer, MaxEffectiveChargeTime)
+	distance := effectiveTime * (BaseSpeed * DashDistMultiplier)
+	p.ChargeTimer = 0
+
+	if distance < 10 {
+		p.CurrentState = Idle
+		return
+	}
+
+	p.CurrentState = Dashing
+	p.StateTimer = DashDuration
+	p.HasHit = false
+
+	// 【核心修复】：恢复 360 度鼠标瞄准冲刺
+	dirToMouse := Vector2{X: p.Input.MouseX - p.Position.X, Z: p.Input.MouseY - p.Position.Z}
+	dir := dirToMouse.Normalized()
+	if dir.Length() == 0 {
+		dir = Vector2{X: p.FacingX, Z: 0} // 兜底保护
+	}
+	initialBurstSpeed := distance * DashFriction
+	p.Velocity = p.Velocity.Add(dir.Mul(initialBurstSpeed))
+
+	// 极速者大招期间停止积攒能量
+	if p.SpeedsterBuffTimer <= 0 {
+		energyGain := int32(effectiveTime * 2.0)
+		p.Energy += energyGain
+		if p.Energy > 15 {
+			p.Energy = 15
+		}
+	}
+}
+
+// ===== 新增代码 END =====
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\battle\room.go ---
+
+package battle
+
+import (
+	"time"
+
+	pb "github.com/TimeCraker/game-backend-demo/services/proto"
+	"google.golang.org/protobuf/proto"
+)
+
+// ===== 新增代码 START =====
+// 修改内容：定义战斗房间输入事件结构
+// 修改原因：将网关上行输入转为强类型结构，便于在固定帧中消费
+// 影响范围：battle.Room 输入处理与后续网关接入层
+type InputEvent struct {
+	UserID uint32
+	Input  InputSnapshot
+}
+
+// BattleRoom 表示一个服务端权威战斗房间（当前脚手架支持 1v1）。
+type BattleRoom struct {
+	// RoomID：房间唯一标识，与匹配系统产出的 room_id 一致
+	RoomID string
+	// Player1/Player2：当前房间的两名对战玩家状态
+	Player1 BattlePlayer
+	Player2 BattlePlayer
+
+	// IsGameOver：战斗是否已进入结算，避免重复广播与重复停止房间
+	IsGameOver bool
+
+	// InputCh：输入通道，由网关将客户端输入投递到该通道
+	InputCh chan InputEvent
+	// UltCh：大招指令通道（JSON cast_ultimate）
+	UltCh chan uint32
+	// BroadcastCh：每帧下行快照通道，供网关消费并广播给前端
+	BroadcastCh chan []byte
+	// stopCh：用于优雅停止房间 tick 循环
+	stopCh chan struct{}
+}
+
+// NewBattleRoom 创建一个可运行的战斗房间脚手架。
+func NewBattleRoom(roomID string, p1ID, p2ID uint32) *BattleRoom {
+	return &BattleRoom{
+		RoomID: roomID,
+		Player1: BattlePlayer{
+			UserID:       p1ID,
+			CurrentState: Idle,
+			Position:     Vector2{X: -300, Z: 0},
+			HP:           100,
+			Energy:       0,
+			FacingX:      1.0,
+		},
+		Player2: BattlePlayer{
+			UserID:       p2ID,
+			CurrentState: Idle,
+			Position:     Vector2{X: 300, Z: 0},
+			HP:           100,
+			Energy:       0,
+			FacingX:      -1.0,
+		},
+		InputCh:     make(chan InputEvent, 128),
+		UltCh:       make(chan uint32, 10),
+		BroadcastCh: make(chan []byte, 128),
+		stopCh:      make(chan struct{}),
+	}
+}
+
+// Start 以 60Hz 固定帧推进战斗逻辑，并在每帧输出 state 快照。
+func (r *BattleRoom) Start() {
+	ticker := time.NewTicker(time.Second / 60)
+	defer ticker.Stop()
+
+	last := time.Now()
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case ev := <-r.InputCh:
+			r.applyInput(ev)
+		case uid := <-r.UltCh:
+			r.applyUltimate(uid)
+		case now := <-ticker.C:
+			delta := now.Sub(last).Seconds()
+			last = now
+
+			r.updatePhysics(delta)
+			r.emitStateSnapshot()
+		}
+	}
+}
+
+// Stop 结束房间循环。
+func (r *BattleRoom) Stop() {
+	select {
+	case <-r.stopCh:
+		// 已关闭，不重复 close
+	default:
+		close(r.stopCh)
+	}
+}
+
+// applyInput 按 user_id 将最新输入写入玩家缓存。
+func (r *BattleRoom) applyInput(ev InputEvent) {
+	switch ev.UserID {
+	case r.Player1.UserID:
+		r.Player1.Input = ev.Input
+	case r.Player2.UserID:
+		r.Player2.Input = ev.Input
+	}
+}
+
+func (r *BattleRoom) applyUltimate(uid uint32) {
+	var p *BattlePlayer
+	if r.Player1.UserID == uid {
+		p = &r.Player1
+	} else if r.Player2.UserID == uid {
+		p = &r.Player2
+	} else {
+		return
+	}
+
+	if p.Energy >= 15 && p.CurrentState != Dead && p.CurrentState != HitStun {
+		p.Energy = 0
+		p.ChargeTimer = 0
+
+		p.CurrentState = SkillCast
+		p.StateTimer = 0.1 // 全角色通用：0.1s 霸体前摇
+
+		switch p.ClassID {
+		case "Role1_Speedster": // 极速者：挂载 15 秒状态
+			p.SpeedsterBuffTimer = 15.0
+		case "Role3_Reviver":
+			// 预留复苏者逻辑
+		}
+	}
+}
+
+// updatePhysics 执行每帧战斗物理推进。
+func (r *BattleRoom) updatePhysics(delta float64) {
+	// 修改内容：在每帧开始先批量消费 InputCh，避免输入滞后到下一帧
+	// 修改原因：客户端输入可能在单帧内到达多条，需取最新意图推进权威状态
+	// 影响范围：战斗输入响应速度与状态一致性
+	for {
+		select {
+		case ev := <-r.InputCh:
+			r.applyInput(ev)
+		default:
+			goto done
+		}
+	}
+done:
+	r.Player1.Update(delta)
+	r.Player2.Update(delta)
+	r.runCombatArbiter()
+}
+
+func (r *BattleRoom) runCombatArbiter() {
+	p1 := &r.Player1
+	p2 := &r.Player2
+
+	p1MeleeHitP2 := r.checkMeleeHit(p1, p2)
+	p2MeleeHitP1 := r.checkMeleeHit(p2, p1)
+	p1DashHitP2 := r.checkDashHit(p1, p2)
+	p2DashHitP1 := r.checkDashHit(p2, p1)
+
+	// 情况 A【绝对拼刀】优先级最高。
+	if (p1DashHitP2 && p2DashHitP1) ||
+		(p1MeleeHitP2 && p2.CurrentState == Dashing) ||
+		(p2MeleeHitP1 && p1.CurrentState == Dashing) {
+		r.applyClash(p1, p2)
+		r.enforceDeath(p1)
+		r.enforceDeath(p2)
+		return
+	}
+
+	// 情况 B【单方碾压】按顺序执行，首个命中会改变状态避免重复结算。
+	if p1MeleeHitP2 || p1DashHitP2 {
+		if p2.CurrentState != Dashing {
+			r.applyNormalHit(p1, p2)
+		}
+	}
+	if p2MeleeHitP1 || p2DashHitP1 {
+		if p1.CurrentState != Dashing {
+			r.applyNormalHit(p2, p1)
+		}
+	}
+
+	r.enforceDeath(p1)
+	r.enforceDeath(p2)
+}
+
+func (r *BattleRoom) checkMeleeHit(attacker, victim *BattlePlayer) bool {
+	if attacker.CurrentState != Attack || attacker.HasHit {
+		return false
+	}
+	dirToVictimRaw := victim.Position.Sub(attacker.Position)
+	dist := dirToVictimRaw.Length()
+	if dist > MeleeRadius || dist == 0 {
+		return false
+	}
+
+	dirToVictim := dirToVictimRaw.Normalized()
+	// 【核心修复】：恢复 360 度鼠标瞄准的扇形攻击判定
+	dirToMouse := Vector2{X: attacker.Input.MouseX - attacker.Position.X, Z: attacker.Input.MouseY - attacker.Position.Z}
+	facingDir := dirToMouse.Normalized()
+	if facingDir.Length() == 0 {
+		facingDir = Vector2{X: attacker.FacingX, Z: 0}
+	}
+	return dirToVictim.Dot(facingDir) >= 0.5
+}
+
+func (r *BattleRoom) checkDashHit(attacker, victim *BattlePlayer) bool {
+	if attacker.CurrentState != Dashing || attacker.HasHit {
+		return false
+	}
+	dist := attacker.Position.Sub(victim.Position).Length()
+	return dist <= DashHitRadius
+}
+
+func (r *BattleRoom) applyClash(p1, p2 *BattlePlayer) {
+	p1.HP -= BaseDamage
+	p2.HP -= BaseDamage
+
+	p1.CurrentState = HitStun
+	p2.CurrentState = HitStun
+	p1.StateTimer = HitStunClash
+	p2.StateTimer = HitStunClash
+
+	// 拼刀弹开：双方向自己原本速度的反方向弹开
+	push1 := p1.Velocity.Normalized().Mul(-1.0)
+	push2 := p2.Velocity.Normalized().Mul(-1.0)
+	if push1.Length() == 0 {
+		push1 = Vector2{X: -p1.FacingX, Z: 0}
+	}
+	if push2.Length() == 0 {
+		push2 = Vector2{X: -p2.FacingX, Z: 0}
+	}
+	p1.Velocity = push1.Mul(KnockbackSpeed)
+	p2.Velocity = push2.Mul(KnockbackSpeed)
+
+	p1.ChargeTimer = 0
+	p2.ChargeTimer = 0
+
+	p1.HasHit = true
+	p2.HasHit = true
+}
+
+func (r *BattleRoom) applyNormalHit(attacker, victim *BattlePlayer) {
+	// 【全角色通用底层机制】霸体判定：SkillCast 期间绝对不可被打断
+	if victim.CurrentState == SkillCast {
+		victim.HP -= BaseDamage
+		var bounceDir Vector2
+		if attacker.CurrentState == Dashing {
+			bounceDir = attacker.Velocity.Normalized().Mul(-1.0)
+		} else {
+			dirToMouse := Vector2{X: attacker.Input.MouseX - attacker.Position.X, Z: attacker.Input.MouseY - attacker.Position.Z}
+			bounceDir = dirToMouse.Normalized().Mul(-1.0)
+			if bounceDir.Length() == 0 {
+				bounceDir = Vector2{X: -attacker.FacingX, Z: 0}
+			}
+		}
+		attacker.CurrentState = HitStun
+		attacker.StateTimer = HitStunNormal
+		attacker.HasHit = true
+		attacker.Velocity = bounceDir.Mul(KnockbackSpeed)
+		return
+	}
+
+	attacker.Energy += EnergyReward
+	if attacker.Energy > 15 {
+		attacker.Energy = 15
+	}
+	attacker.CurrentState = PostCast
+	attacker.StateTimer = AttackPostCastHit
+	attacker.Velocity = Vector2{}
+	attacker.HasHit = true
+
+	victim.HP -= BaseDamage
+	victim.CurrentState = HitStun
+	victim.StateTimer = HitStunNormal
+	victim.ChargeTimer = 0
+
+	// 根据攻击方式决定绝对击退方向，防止穿模后坐标反转导致“吸人”
+	var pushDir Vector2
+	if attacker.CurrentState == Dashing {
+		pushDir = attacker.Velocity.Normalized()
+	} else {
+		dirToMouse := Vector2{X: attacker.Input.MouseX - attacker.Position.X, Z: attacker.Input.MouseY - attacker.Position.Z}
+		pushDir = dirToMouse.Normalized()
+		if pushDir.Length() == 0 {
+			pushDir = Vector2{X: attacker.FacingX, Z: 0}
+		}
+	}
+	victim.Velocity = pushDir.Mul(KnockbackSpeed)
+}
+
+func (r *BattleRoom) enforceDeath(p *BattlePlayer) {
+	if p.HP > 0 {
+		return
+	}
+	p.HP = 0
+	p.CurrentState = Dead
+	p.StateTimer = 0
+
+	// ===== 新增代码 START =====
+	// 修改内容：在战斗首次进入死亡结算时，广播 game_over 并在 4 秒后安全停止物理协程
+	// 修改原因：触发客户端子弹时间演出并确保服务端内存安全销毁（避免重复 Stop）
+	// 影响范围：仅影响结算阶段的广播与房间停止时机，不改变击中/死亡状态本身
+	// 如果游戏还没结束，触发结算广播与延迟关停逻辑
+	if !r.IsGameOver {
+		r.IsGameOver = true
+
+		// 找出胜利者 ID
+		winnerID := r.Player1.UserID
+		if p.UserID == r.Player1.UserID {
+			winnerID = r.Player2.UserID
+		}
+
+		// 立即广播游戏结束，让客户端播慢动作特写
+		msg := &pb.GameMessage{
+			Type:   "game_over",
+			RoomId: r.RoomID,
+			UserId: winnerID,
+		}
+		payload, _ := proto.Marshal(msg)
+		select {
+		case r.BroadcastCh <- payload:
+		default:
+		}
+
+		// 开启 4 秒倒计时，4 秒后安全销毁物理引擎协程
+		go func() {
+			time.Sleep(4 * time.Second)
+			r.Stop()
+		}()
+	}
+	// ===== 新增代码 END =====
+}
+
+// emitStateSnapshot 将当前房间玩家状态组装为协议消息并投递到广播通道。
+func (r *BattleRoom) emitStateSnapshot() {
+	msg := &pb.GameMessage{
+		Type:   "state",
+		RoomId: r.RoomID,
+		Players: []*pb.PlayerPos{
+			{
+				UserId:       r.Player1.UserID,
+				X:            float32(r.Player1.Position.X),
+				Y:            float32(r.Player1.Y),
+				Z:            float32(r.Player1.Position.Z),
+				RotY:         float32(r.Player1.RotY),
+				CurrentState: uint32(r.Player1.CurrentState),
+				Hp:           r.Player1.HP,
+				Energy:       r.Player1.Energy,
+			},
+			{
+				UserId:       r.Player2.UserID,
+				X:            float32(r.Player2.Position.X),
+				Y:            float32(r.Player2.Y),
+				Z:            float32(r.Player2.Position.Z),
+				RotY:         float32(r.Player2.RotY),
+				CurrentState: uint32(r.Player2.CurrentState),
+				Hp:           r.Player2.HP,
+				Energy:       r.Player2.Energy,
+			},
+		},
+	}
+
+	payload, err := proto.Marshal(msg)
+	if err != nil {
+		return
+	}
+
+	// 非阻塞写入：避免消费者短暂阻塞时拖慢 60Hz 主循环。
+	select {
+	case r.BroadcastCh <- payload:
+	default:
+	}
+}
+
+// ===== 新增代码 END =====
+
 --- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\gateway\handlers\hub.go ---
 
 package handlers
@@ -837,75 +1510,69 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	// 引入 battle 引擎与 match
+	"github.com/TimeCraker/game-backend-demo/services/battle"
 	"github.com/TimeCraker/game-backend-demo/services/match"
 	pb "github.com/TimeCraker/game-backend-demo/services/proto"
 	"google.golang.org/protobuf/proto"
 )
 
-// Client 代表一个在线的玩家连接（大厅或战斗）
+// Client 代表一个受并发保护的在线玩家连接（兼容大厅与战斗）
 type Client struct {
 	UserID int
 	Conn   *websocket.Conn
-	RoomID string // 非空表示已加入某战斗房间（仅用于 Rooms 映射 bookkeeping）
-	// ===== 新增代码 START =====
-	// 修改内容：用于保护 WebSocket 并发写入
-	// 修改原因：gorilla/websocket 不允许同一个 Conn 被多个协程并发 WriteMessage
-	// 影响范围：仅保护该客户端的 Conn 写入路径
-	mu sync.Mutex
-	// ===== 新增代码 END =====
+	RoomID string
+	mu     sync.Mutex // 核心修复：严格保护 WebSocket 的并发写入
 }
 
-// Room 匹配引擎创建的 room 元数据（允许进入该房间的用户 ID 列表）
+// WriteMessage 封装并发安全的写入，彻底杜绝 Panic 崩溃
+func (c *Client) WriteMessage(messageType int, data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Conn.WriteMessage(messageType, data)
+}
+
 type Room struct {
 	ID      string
 	Players []int
 }
 
-// Hub 网关枢纽：大厅连接用 Clients；战斗房间用 Rooms + roomMu
 type Hub struct {
-	Clients sync.Map // userID -> *websocket.Conn（大厅）
-
-	// RegisteredRooms：匹配结果写入的 room 元数据（校验玩家是否有权进入 roomId）
-	RegisteredRooms sync.Map // roomID -> *Room
+	Clients         sync.Map // userID -> *Client (统一管理)
+	RegisteredRooms sync.Map
+	ActiveBattles   sync.Map // roomID -> *battle.BattleRoom
 
 	roomMu sync.RWMutex
-	// Rooms：战斗 WebSocket 客户端按房间隔离（roomID -> 该房间内所有 *Client）
-	Rooms map[string]map[*Client]bool
+	Rooms  map[string]map[*Client]bool
 }
 
-// GlobalHub 全局 Hub
 var GlobalHub = &Hub{
 	Rooms: make(map[string]map[*Client]bool),
 }
 
-// Register 大厅玩家上线
-func (h *Hub) Register(userID int, conn *websocket.Conn) {
-	h.Clients.Store(userID, conn)
+func (h *Hub) Register(userID int, client *Client) {
+	h.Clients.Store(userID, client)
 }
 
-// Unregister 大厅玩家下线
 func (h *Hub) Unregister(userID int) {
 	h.Clients.Delete(userID)
 }
 
-// Broadcast 全服广播（大厅二进制）
 func (h *Hub) Broadcast(message []byte) {
 	h.Clients.Range(func(key, value interface{}) bool {
-		conn := value.(*websocket.Conn)
-		_ = conn.WriteMessage(websocket.BinaryMessage, message)
+		client := value.(*Client)
+		_ = client.WriteMessage(websocket.BinaryMessage, message)
 		return true
 	})
 }
 
-// SendToUser 单播给指定 user（大厅 map 中的连接）
 func (h *Hub) SendToUser(userID int, message []byte) {
 	if c, ok := h.Clients.Load(userID); ok {
-		conn := c.(*websocket.Conn)
-		_ = conn.WriteMessage(websocket.BinaryMessage, message)
+		client := c.(*Client)
+		_ = client.WriteMessage(websocket.BinaryMessage, message)
 	}
 }
 
-// JoinRoom 将战斗客户端加入 Rooms[roomID]（须已持有 *Client，Conn 已就绪）
 func (h *Hub) JoinRoom(client *Client, roomID string) {
 	if client == nil || roomID == "" || client.Conn == nil {
 		return
@@ -924,18 +1591,21 @@ func (h *Hub) JoinRoom(client *Client, roomID string) {
 	m[client] = true
 }
 
-// LeaveRoom 从 Rooms 中移除战斗客户端
 func (h *Hub) LeaveRoom(client *Client) {
 	if client == nil || client.RoomID == "" {
 		return
 	}
-
 	roomID := client.RoomID
 
-	// ===== 新增代码 START =====
-	// 修改内容：客户端断开后，向房间内剩余玩家广播 opponent_left
-	// 修改原因：Unity 端依赖 opponent_left 触发对局结束/退出逻辑
-	// 影响范围：仅影响战斗房间（Rooms）断线离开事件
+	// 【核心修复】只要有任何一方掉线或离开，立刻终止房间内的物理引擎，防止后台泄漏
+	if roomVal, ok := h.ActiveBattles.Load(roomID); ok {
+		if br, castOK := roomVal.(*battle.BattleRoom); castOK {
+			br.Stop()
+		}
+		h.ActiveBattles.Delete(roomID)
+		log.Printf("♻️ [Hub] 玩家 %d 离开，对局终止，房间 %s 物理引擎已安全销毁", client.UserID, roomID)
+	}
+
 	var remainingClients []*Client
 	h.roomMu.Lock()
 	if m, ok := h.Rooms[roomID]; ok {
@@ -949,9 +1619,8 @@ func (h *Hub) LeaveRoom(client *Client) {
 	}
 	client.RoomID = ""
 	h.roomMu.Unlock()
-	// ===== 新增代码 END =====
 
-	// 通知房间内的其他玩家：对手已掉线或退出
+	// 通知剩下的人对手已离开
 	if len(remainingClients) == 0 {
 		return
 	}
@@ -967,16 +1636,10 @@ func (h *Hub) LeaveRoom(client *Client) {
 	}
 
 	for _, c := range remainingClients {
-		if c == nil || c.Conn == nil {
-			continue
-		}
-		c.mu.Lock()
-		_ = c.Conn.WriteMessage(websocket.BinaryMessage, leaveData)
-		c.mu.Unlock()
+		_ = c.WriteMessage(websocket.BinaryMessage, leaveData)
 	}
 }
 
-// BroadcastToRoom 向某房间内所有战斗连接广播（保持原始 WebSocket 帧类型）
 func (h *Hub) BroadcastToRoom(roomID string, messageType int, message []byte) {
 	if roomID == "" {
 		return
@@ -990,24 +1653,10 @@ func (h *Hub) BroadcastToRoom(roomID string, messageType int, message []byte) {
 	h.roomMu.RUnlock()
 
 	for _, c := range clients {
-		if c == nil || c.Conn == nil {
-			continue
-		}
-		// ===== 新增代码 START =====
-		// 修改内容：对同一 Conn 的 WriteMessage 加锁
-		// 修改原因：避免并发写导致后端 panic
-		// 影响范围：仅广播发送路径
-		c.mu.Lock()
-		err := c.Conn.WriteMessage(messageType, message)
-		c.mu.Unlock()
-		if err != nil {
-			// 原有的错误处理：之前直接忽略错误，这里保持一致
-		}
-		// ===== 新增代码 END =====
+		_ = c.WriteMessage(messageType, message)
 	}
 }
 
-// RoomHasUser 判断用户是否在匹配注册的该房间成员列表中
 func (h *Hub) RoomHasUser(roomID string, userID int) bool {
 	if r, ok := h.RegisteredRooms.Load(roomID); ok {
 		room := r.(*Room)
@@ -1030,39 +1679,37 @@ func (h *Hub) ListenMatchResults() {
 			}
 			h.RegisteredRooms.Store(matchRes.RoomID, room)
 
+			// 实例化服务端权威战斗房间并启动 60Hz 引擎
+			battleRoom := battle.NewBattleRoom(matchRes.RoomID, matchRes.Player1, matchRes.Player2)
+			h.ActiveBattles.Store(matchRes.RoomID, battleRoom)
+			go battleRoom.Start()
+
+			// 将物理引擎产出的快照分发给房间内的所有玩家
+			go func(roomID string, r *battle.BattleRoom) {
+				for payload := range r.BroadcastCh {
+					if len(payload) > 0 {
+						GlobalHub.BroadcastToRoom(roomID, websocket.BinaryMessage, payload)
+					}
+				}
+			}(matchRes.RoomID, battleRoom)
+
 			successMsg := &pb.GameMessage{
 				Type:   "match_success",
 				RoomId: matchRes.RoomID,
 			}
-			if successMsg.Type == "match_success" {
-				data, err := json.Marshal(successMsg)
-				if err != nil {
-					log.Printf("❌ JSON 序列化失败: %v", err)
-				} else {
-					if c, ok := h.Clients.Load(int(matchRes.Player1)); ok {
-						conn := c.(*websocket.Conn)
-						if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-							log.Printf("❌ 发送 match_success(TextMessage) 给玩家 %d 失败: %v", matchRes.Player1, err)
-						}
-					}
-					if c, ok := h.Clients.Load(int(matchRes.Player2)); ok {
-						conn := c.(*websocket.Conn)
-						if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-							log.Printf("❌ 发送 match_success(TextMessage) 给玩家 %d 失败: %v", matchRes.Player2, err)
-						}
-					}
+			data, err := json.Marshal(successMsg)
+			if err == nil {
+				if c, ok := h.Clients.Load(int(matchRes.Player1)); ok {
+					client := c.(*Client)
+					_ = client.WriteMessage(websocket.TextMessage, data)
 				}
-			} else {
-				payload, err := proto.Marshal(successMsg)
-				if err != nil {
-					log.Printf("❌ Protobuf 序列化失败: %v", err)
-				} else {
-					h.SendToUser(int(matchRes.Player1), payload)
-					h.SendToUser(int(matchRes.Player2), payload)
+				if c, ok := h.Clients.Load(int(matchRes.Player2)); ok {
+					client := c.(*Client)
+					_ = client.WriteMessage(websocket.TextMessage, data)
 				}
 			}
 
-			log.Printf("🏠 [Hub] 物理房间 %s 已创建并通知玩家 %d 和 %d！", matchRes.RoomID, matchRes.Player1, matchRes.Player2)
+			log.Printf("🏠 [Hub] 物理房间 %s 已创建，引擎轰鸣启动！(P1:%d, P2:%d)", matchRes.RoomID, matchRes.Player1, matchRes.Player2)
 		}
 	}()
 }
@@ -1078,63 +1725,47 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/TimeCraker/game-backend-demo/services/auth/db"
 	"github.com/TimeCraker/game-backend-demo/services/auth/models"
 	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
+
+	"github.com/TimeCraker/game-backend-demo/services/battle"
+	"github.com/TimeCraker/game-backend-demo/services/match"
+	pb "github.com/TimeCraker/game-backend-demo/services/proto"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-
-	// 更新 proto 导入路径，并引入 db 包
-	"github.com/TimeCraker/game-backend-demo/services/auth/db"
-	pb "github.com/TimeCraker/game-backend-demo/services/proto"
 	"google.golang.org/protobuf/proto"
-
-	// 引入匹配引擎包
-	"github.com/TimeCraker/game-backend-demo/services/match"
 )
 
-// 心跳配置常量：用于稳定性保障，防止僵尸连接
 const (
 	pingPeriod = 20 * time.Second
 	pongWait   = 60 * time.Second
 )
 
-// Upgrader 负责把普通的 HTTP 请求“升级”成长连接
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 func HandleWS() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// --- 🟢 第一步：身份大检查 (Authentication) ---
 		tokenString := c.Query("token")
 		if tokenString == "" {
-			log.Println("❌ 拒绝连接：缺少 token")
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少 token"})
 			return
 		}
 
-		// 解析 Token 获取当前玩家 ID
 		claims, err := utils.ParseToken(tokenString)
 		if err != nil {
-			log.Println("❌ 拒绝连接：无效的 token ->", err)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "无效的 token"})
 			return
 		}
 
-		// 显式转换为 int，确保全网关类型统一
 		userID := int(claims.UserID)
-		log.Printf("✅ 玩家 %d 请求建立 WebSocket 连接...", userID)
-
-		// roomId（camelCase）为主，兼容旧版 room_id
 		roomID := c.Query("roomId")
 		if roomID == "" {
 			roomID = c.Query("room_id")
 		}
 
-		// scope：用于显式区分连接语义（lobby/battle）
-		// 方案 A：推荐前端显式传 scope；为兼容旧调用，这里保留在 scope 缺失时基于 roomID 推断。
 		scope := c.Query("scope")
 		if scope == "" {
 			if roomID != "" {
@@ -1144,80 +1775,58 @@ func HandleWS() gin.HandlerFunc {
 			}
 		}
 
-		switch scope {
-		case "lobby":
-			log.Printf("🧭 玩家 %d 建立大厅 WS（scope=lobby）", userID)
-		case "battle":
-			if roomID == "" {
-				log.Printf("❌ 拒绝连接：battle scope 但缺少 roomId，user=%d", userID)
-				c.JSON(http.StatusBadRequest, gin.H{"error": "battle scope requires roomId"})
-				return
-			}
-			log.Printf("🧭 玩家 %d 建立战斗 WS（scope=battle, roomId=%s）", userID, roomID)
-		default:
-			log.Printf("❌ 拒绝连接：未知 scope=%s，user=%d", scope, userID)
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid scope"})
+		if scope == "battle" && roomID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "battle scope requires roomId"})
 			return
 		}
 
-		// --- 🟡 第二步：升级协议为 WebSocket (Upgrade) ---
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
-			log.Println("❌ 升级 WebSocket 失败:", err)
 			return
 		}
 
-		var battleClient *Client
+		// 【核心修复】无论是大厅还是战斗，全部包装为带并发锁的安全 Client
+		client := &Client{UserID: userID, Conn: conn}
 
-		// --- 🔵 第三步：注册玩家并初始化状态 (Initialization) ---
-		// battle 连接不进入 GlobalHub.Clients，避免大厅广播误伤战斗帧
 		if scope == "lobby" {
-			GlobalHub.Register(userID, conn)
-			log.Printf("🎉 玩家 %d 已成功加入 GlobalHub", userID)
-			sendInitialPlayersData(conn)
+			GlobalHub.Register(userID, client)
+			sendInitialPlayersData(client)
 			broadcastNewPlayerJoin(userID)
 		} else {
 			if !GlobalHub.RoomHasUser(roomID, userID) {
-				log.Printf("❌ 玩家 %d 尝试加入非法房间 roomId=%s，已拒绝", userID, roomID)
-				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"非法房间"}`))
+				_ = client.WriteMessage(websocket.TextMessage, []byte(`{"error":"非法房间"}`))
 				_ = conn.Close()
 				return
 			}
-			battleClient = &Client{UserID: userID, Conn: conn}
-			GlobalHub.JoinRoom(battleClient, roomID)
-			log.Printf("🏠 玩家 %d 已加入 Hub.Rooms roomId=%s", userID, roomID)
+			GlobalHub.JoinRoom(client, roomID)
+			log.Printf("🏠 玩家 %d 已加入战斗房间 roomId=%s", userID, roomID)
 		}
 
-		// --- 心跳机制 (Ping/Pong) ---
 		conn.SetReadDeadline(time.Now().Add(pongWait))
 		conn.SetPongHandler(func(string) error {
 			conn.SetReadDeadline(time.Now().Add(pongWait))
 			return nil
 		})
 
+		// 心跳协程：现在通过 client.WriteMessage 发送，完美杜绝了多协程并发写入 Panic
 		go func() {
 			ticker := time.NewTicker(pingPeriod)
 			defer ticker.Stop()
 			for {
 				<-ticker.C
-				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				if err := client.WriteMessage(websocket.PingMessage, nil); err != nil {
 					return
 				}
 			}
 		}()
 
-		// --- 🔴 第四步：死循环监听前端消息 (Read Loop) ---
+		// 唯一的、干净的读消息循环
 		for {
 			messageType, message, err := conn.ReadMessage()
 			if err != nil {
-				log.Printf("⚠️ 玩家 %d 断开连接 (roomId=%s): %v", userID, roomID, err)
-
-				// 如果意外断线，顺手从匹配池中移除该玩家，防挂机
 				match.GlobalMatcher.RemovePlayer(uint32(userID))
-
-				if battleClient != nil {
-					GlobalHub.LeaveRoom(battleClient)
-					log.Printf("🏚️ 玩家 %d 已离开 Hub.Rooms roomId=%s", userID, roomID)
+				if scope == "battle" {
+					GlobalHub.LeaveRoom(client)
 				} else {
 					GlobalHub.Unregister(userID)
 					broadcastPlayerLeave(userID)
@@ -1225,51 +1834,84 @@ func HandleWS() gin.HandlerFunc {
 				break
 			}
 
-			// 方案 A：battle 连接所有消息只转发到房间，不走大厅逻辑
-			if scope == "battle" {
-				GlobalHub.BroadcastToRoom(roomID, messageType, message)
-				continue
+			// 拦截 Godot 发来的 JSON 文本格式大招指令
+			if len(message) > 0 && message[0] == '{' {
+				var jsonObj struct {
+					Type string `json:"type"`
+				}
+				if err := json.Unmarshal(message, &jsonObj); err == nil && jsonObj.Type == "cast_ultimate" {
+					if scope == "battle" {
+						if roomValue, ok := GlobalHub.ActiveBattles.Load(roomID); ok {
+							if br, castOK := roomValue.(*battle.BattleRoom); castOK {
+								select {
+								case br.UltCh <- uint32(userID):
+								default:
+								}
+							}
+						}
+					}
+					continue
+				}
 			}
 
-			// 解析前端/客户端发来的消息（Text -> JSON；Binary -> Protobuf）
+			// 统一解码层
 			var msg pb.GameMessage
-			switch messageType {
-			case websocket.TextMessage:
+			if messageType == websocket.TextMessage {
 				if err := json.Unmarshal(message, &msg); err != nil {
-					log.Println("❌ JSON 解析失败:", err)
 					continue
 				}
-			case websocket.BinaryMessage:
+			} else if messageType == websocket.BinaryMessage {
 				if err := proto.Unmarshal(message, &msg); err != nil {
-					log.Println("❌ Protobuf 解析失败:", err)
 					continue
 				}
-			default:
-				log.Printf("⚠️ 收到不支持的 WebSocket messageType=%d，已忽略", messageType)
+			} else {
 				continue
 			}
 
-			// 拦截 1：请求匹配
+			// 全局拦截：匹配请求
 			if msg.Type == "match_req" {
 				match.GlobalMatcher.AddPlayer(uint32(userID))
-				continue // 处理完毕，阻断后续逻辑
+				continue
 			}
 
-			// --- 如果没有被拦截，说明是大厅全局消息，走传统分流逻辑 ---
+			// 战斗作用域路由
+			if scope == "battle" {
+				if msg.Type == "input" {
+					if roomValue, ok := GlobalHub.ActiveBattles.Load(roomID); ok {
+						if battleRoom, castOK := roomValue.(*battle.BattleRoom); castOK {
+							// 非阻塞丢入物理引擎，绝不卡死主协程
+							select {
+							case battleRoom.InputCh <- battle.InputEvent{
+								UserID: uint32(userID),
+								Input: battle.InputSnapshot{
+									InputX:      float64(msg.InputX),
+									InputY:      float64(msg.InputY),
+									IsCharging:  msg.IsCharging,
+									IsAttacking: msg.IsAttacking,
+									MouseX:      float64(msg.MouseX),
+									MouseY:      float64(msg.MouseY),
+								},
+							}:
+							default:
+							}
+						}
+					}
+				}
+				continue
+			}
+
+			// 大厅作用域路由
 			if msg.Type == "chat" {
 				handleChatLogic(userID, msg.Content)
 			} else if msg.Type == "move" {
-				// 仅做为大厅站街时的漫游保存
 				handleMoveLogic(userID, msg.X, msg.Y, msg.Z)
 			}
 		}
 	}
 }
 
-// 【Protobuf】下发初始化包
-func sendInitialPlayersData(conn *websocket.Conn) {
+func sendInitialPlayersData(client *Client) {
 	var pbPlayers []*pb.PlayerPos
-
 	GlobalHub.Clients.Range(func(key, value interface{}) bool {
 		id := key.(int)
 		var pos models.PlayerPosition
@@ -1284,41 +1926,21 @@ func sendInitialPlayersData(conn *websocket.Conn) {
 		}
 		return true
 	})
-
 	if len(pbPlayers) > 0 {
-		data := &pb.GameMessage{
-			Type:    "init_players",
-			Players: pbPlayers,
-		}
-
+		data := &pb.GameMessage{Type: "init_players", Players: pbPlayers}
 		payload, _ := proto.Marshal(data)
-		_ = conn.WriteMessage(websocket.BinaryMessage, payload)
+		_ = client.WriteMessage(websocket.BinaryMessage, payload)
 	}
 }
 
-// ===== 修改代码 START =====
-// 修改内容：统一参数为 userID int，并在使用时强制转换
-// 修改原因：修复 cannot use userID (variable of type int) as uint value 的编译报错
-
-// 【Protobuf】处理聊天业务
 func handleChatLogic(userID int, content string) {
-	msgRecord := models.Message{
-		Sender:  fmt.Sprintf("玩家 %d", userID),
-		Content: content,
-	}
+	msgRecord := models.Message{Sender: fmt.Sprintf("玩家 %d", userID), Content: content}
 	db.SQLDB.Create(&msgRecord)
-
-	// 构造 Protobuf 响应包
-	resp := &pb.GameMessage{
-		Type:    "chat",
-		Content: content,
-		UserId:  uint32(userID),
-	}
+	resp := &pb.GameMessage{Type: "chat", Content: content, UserId: uint32(userID)}
 	payload, _ := proto.Marshal(resp)
 	GlobalHub.Broadcast(payload)
 }
 
-// 【Protobuf】处理玩家移动业务
 func handleMoveLogic(userID int, x, y, z float32) {
 	var pos models.PlayerPosition
 	if err := db.SQLDB.Where("user_id = ?", userID).First(&pos).Error; err != nil {
@@ -1330,32 +1952,18 @@ func handleMoveLogic(userID int, x, y, z float32) {
 		pos.Z = float64(z)
 		db.SQLDB.Save(&pos)
 	}
-
-	resp := &pb.GameMessage{
-		Type:   "move",
-		UserId: uint32(userID),
-		X:      x,
-		Y:      y,
-		Z:      z,
-	}
+	resp := &pb.GameMessage{Type: "move", UserId: uint32(userID), X: x, Y: y, Z: z}
 	payload, _ := proto.Marshal(resp)
 	GlobalHub.Broadcast(payload)
 }
 
-// 【Protobuf】处理玩家加入大厅的广播
 func broadcastNewPlayerJoin(userID int) {
 	var pos models.PlayerPosition
 	if err := db.SQLDB.Where("user_id = ?", userID).First(&pos).Error; err == nil {
 		resp := &pb.GameMessage{
 			Type: "init_players",
 			Players: []*pb.PlayerPos{
-				{
-					UserId: uint32(userID),
-					X:      float32(pos.X),
-					Y:      float32(pos.Y),
-					Z:      float32(pos.Z),
-					RotY:   0,
-				},
+				{UserId: uint32(userID), X: float32(pos.X), Y: float32(pos.Y), Z: float32(pos.Z), RotY: 0},
 			},
 		}
 		payload, _ := proto.Marshal(resp)
@@ -1363,17 +1971,11 @@ func broadcastNewPlayerJoin(userID int) {
 	}
 }
 
-// 【Protobuf】处理玩家离开大厅的广播
 func broadcastPlayerLeave(userID int) {
-	resp := &pb.GameMessage{
-		Type:   "logout",
-		UserId: uint32(userID),
-	}
+	resp := &pb.GameMessage{Type: "logout", UserId: uint32(userID)}
 	payload, _ := proto.Marshal(resp)
 	GlobalHub.Broadcast(payload)
 }
-
-// ===== 修改代码 END =====
 
 --- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\match\matcher.go ---
 
@@ -1523,7 +2125,16 @@ type GameMessage struct {
 	// 修改内容：新增朝向同步字段 rot_y，用于远端玩家丝滑旋转同步与多帧视觉稳定
 	// 修改原因：在 move 类消息中附带 transform.eulerAngles.y，避免远端旋转出现轻微卡顿
 	// 影响范围：仅影响 move/同步类消息；大厅未必填充该字段
-	RotY          float32 `protobuf:"fixed32,10,opt,name=rot_y,json=rotY,proto3" json:"rot_y,omitempty"` // ===== 新增代码 END =====
+	RotY float32 `protobuf:"fixed32,10,opt,name=rot_y,json=rotY,proto3" json:"rot_y,omitempty"`
+	// 修改内容：新增客户端输入同步字段（服务端权威接管所需）
+	// 修改原因：将客户端输入上行给服务端，由服务端统一推进状态与广播快照
+	// 影响范围：battle 场景输入消息；其他消息类型可保持默认零值
+	InputX        float32 `protobuf:"fixed32,11,opt,name=input_x,json=inputX,proto3" json:"input_x,omitempty"`
+	InputY        float32 `protobuf:"fixed32,12,opt,name=input_y,json=inputY,proto3" json:"input_y,omitempty"`
+	IsCharging    bool    `protobuf:"varint,13,opt,name=is_charging,json=isCharging,proto3" json:"is_charging,omitempty"`
+	IsAttacking   bool    `protobuf:"varint,14,opt,name=is_attacking,json=isAttacking,proto3" json:"is_attacking,omitempty"`
+	MouseX        float32 `protobuf:"fixed32,15,opt,name=mouse_x,json=mouseX,proto3" json:"mouse_x,omitempty"`
+	MouseY        float32 `protobuf:"fixed32,16,opt,name=mouse_y,json=mouseY,proto3" json:"mouse_y,omitempty"` // ===== 新增代码 END =====
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1628,13 +2239,61 @@ func (x *GameMessage) GetRotY() float32 {
 	return 0
 }
 
+func (x *GameMessage) GetInputX() float32 {
+	if x != nil {
+		return x.InputX
+	}
+	return 0
+}
+
+func (x *GameMessage) GetInputY() float32 {
+	if x != nil {
+		return x.InputY
+	}
+	return 0
+}
+
+func (x *GameMessage) GetIsCharging() bool {
+	if x != nil {
+		return x.IsCharging
+	}
+	return false
+}
+
+func (x *GameMessage) GetIsAttacking() bool {
+	if x != nil {
+		return x.IsAttacking
+	}
+	return false
+}
+
+func (x *GameMessage) GetMouseX() float32 {
+	if x != nil {
+		return x.MouseX
+	}
+	return 0
+}
+
+func (x *GameMessage) GetMouseY() float32 {
+	if x != nil {
+		return x.MouseY
+	}
+	return 0
+}
+
 type PlayerPos struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	UserId        uint32                 `protobuf:"varint,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
-	X             float32                `protobuf:"fixed32,2,opt,name=x,proto3" json:"x,omitempty"`
-	Y             float32                `protobuf:"fixed32,3,opt,name=y,proto3" json:"y,omitempty"`
-	Z             float32                `protobuf:"fixed32,4,opt,name=z,proto3" json:"z,omitempty"`
-	RotY          float32                `protobuf:"fixed32,5,opt,name=rot_y,json=rotY,proto3" json:"rot_y,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	UserId uint32                 `protobuf:"varint,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	X      float32                `protobuf:"fixed32,2,opt,name=x,proto3" json:"x,omitempty"`
+	Y      float32                `protobuf:"fixed32,3,opt,name=y,proto3" json:"y,omitempty"`
+	Z      float32                `protobuf:"fixed32,4,opt,name=z,proto3" json:"z,omitempty"`
+	RotY   float32                `protobuf:"fixed32,5,opt,name=rot_y,json=rotY,proto3" json:"rot_y,omitempty"`
+	// 修改内容：新增服务端状态快照字段
+	// 修改原因：服务端需要将玩家状态机状态、生命值、能量值下行给客户端
+	// 影响范围：state 类型广播与战斗 HUD 同步
+	CurrentState  uint32 `protobuf:"varint,6,opt,name=current_state,json=currentState,proto3" json:"current_state,omitempty"`
+	Hp            int32  `protobuf:"varint,7,opt,name=hp,proto3" json:"hp,omitempty"`
+	Energy        int32  `protobuf:"varint,8,opt,name=energy,proto3" json:"energy,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1704,6 +2363,27 @@ func (x *PlayerPos) GetRotY() float32 {
 	return 0
 }
 
+func (x *PlayerPos) GetCurrentState() uint32 {
+	if x != nil {
+		return x.CurrentState
+	}
+	return 0
+}
+
+func (x *PlayerPos) GetHp() int32 {
+	if x != nil {
+		return x.Hp
+	}
+	return 0
+}
+
+func (x *PlayerPos) GetEnergy() int32 {
+	if x != nil {
+		return x.Energy
+	}
+	return 0
+}
+
 type ChatLog struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Sender        string                 `protobuf:"bytes,1,opt,name=sender,proto3" json:"sender,omitempty"`
@@ -1761,7 +2441,7 @@ var File_game_proto protoreflect.FileDescriptor
 const file_game_proto_rawDesc = "" +
 	"\n" +
 	"\n" +
-	"game.proto\x12\x05proto\"\x82\x02\n" +
+	"game.proto\x12\x05proto\"\xaa\x03\n" +
 	"\vGameMessage\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x17\n" +
 	"\auser_id\x18\x02 \x01(\rR\x06userId\x12\x18\n" +
@@ -1773,13 +2453,23 @@ const file_game_proto_rawDesc = "" +
 	"\ahistory\x18\b \x03(\v2\x0e.proto.ChatLogR\ahistory\x12\x17\n" +
 	"\aroom_id\x18\t \x01(\tR\x06roomId\x12\x13\n" +
 	"\x05rot_y\x18\n" +
-	" \x01(\x02R\x04rotY\"c\n" +
+	" \x01(\x02R\x04rotY\x12\x17\n" +
+	"\ainput_x\x18\v \x01(\x02R\x06inputX\x12\x17\n" +
+	"\ainput_y\x18\f \x01(\x02R\x06inputY\x12\x1f\n" +
+	"\vis_charging\x18\r \x01(\bR\n" +
+	"isCharging\x12!\n" +
+	"\fis_attacking\x18\x0e \x01(\bR\visAttacking\x12\x17\n" +
+	"\amouse_x\x18\x0f \x01(\x02R\x06mouseX\x12\x17\n" +
+	"\amouse_y\x18\x10 \x01(\x02R\x06mouseY\"\xb0\x01\n" +
 	"\tPlayerPos\x12\x17\n" +
 	"\auser_id\x18\x01 \x01(\rR\x06userId\x12\f\n" +
 	"\x01x\x18\x02 \x01(\x02R\x01x\x12\f\n" +
 	"\x01y\x18\x03 \x01(\x02R\x01y\x12\f\n" +
 	"\x01z\x18\x04 \x01(\x02R\x01z\x12\x13\n" +
-	"\x05rot_y\x18\x05 \x01(\x02R\x04rotY\";\n" +
+	"\x05rot_y\x18\x05 \x01(\x02R\x04rotY\x12#\n" +
+	"\rcurrent_state\x18\x06 \x01(\rR\fcurrentState\x12\x0e\n" +
+	"\x02hp\x18\a \x01(\x05R\x02hp\x12\x16\n" +
+	"\x06energy\x18\b \x01(\x05R\x06energy\";\n" +
 	"\aChatLog\x12\x16\n" +
 	"\x06sender\x18\x01 \x01(\tR\x06sender\x12\x18\n" +
 	"\acontent\x18\x02 \x01(\tR\acontentB\tZ\a./protob\x06proto3"

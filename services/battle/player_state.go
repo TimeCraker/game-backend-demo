@@ -101,10 +101,17 @@ type BattlePlayer struct {
 	HasHit bool
 	// Input：最近一次收到的输入快照
 	Input InputSnapshot
+	// ClassID：角色职业（如 Role1_Speedster），用于大招补丁分发
+	ClassID string
+	// SpeedsterBuffTimer：极速者大招 Buff 倒计时（蓄力加速、取消后摇、停能量等）
+	SpeedsterBuffTimer float64
 }
 
 // Update 在单个 fixed-tick 内推进玩家状态机与物理。
 func (p *BattlePlayer) Update(delta float64) {
+	if p.SpeedsterBuffTimer > 0 {
+		p.SpeedsterBuffTimer -= delta
+	}
 	// 修改内容：先推进计时状态机，严格复刻 PreCast->Attack->PostCast->Idle 时间链
 	// 修改原因：Go 端无 create_timer，需要用显式倒计时保证服务端权威一致性
 	// 影响范围：攻击前后摇、受击硬直等离散动作状态切换
@@ -118,16 +125,26 @@ func (p *BattlePlayer) Update(delta float64) {
 			p.HasHit = false
 			p.StateTimer = AttackDuration
 		case Attack:
-			p.CurrentState = PostCast
-			if p.HasHit {
-				p.StateTimer = AttackPostCastHit
+			if p.SpeedsterBuffTimer > 0 {
+				p.CurrentState = Idle // 极速者大招：完全取消攻击后摇
+				p.StateTimer = 0
 			} else {
-				p.StateTimer = AttackPostCastMiss
+				p.CurrentState = PostCast
+				if p.HasHit {
+					p.StateTimer = AttackPostCastHit
+				} else {
+					p.StateTimer = AttackPostCastMiss
+				}
 			}
 		case Dashing:
-			p.CurrentState = PostCast
-			p.StateTimer = DashPostCast
-		case PostCast, HitStun:
+			if p.SpeedsterBuffTimer > 0 {
+				p.CurrentState = Idle // 极速者大招：完全取消冲刺后摇
+				p.StateTimer = 0
+			} else {
+				p.CurrentState = PostCast
+				p.StateTimer = DashPostCast
+			}
+		case PostCast, HitStun, SkillCast:
 			p.CurrentState = Idle
 			p.StateTimer = 0
 		}
@@ -155,7 +172,11 @@ func (p *BattlePlayer) Update(delta float64) {
 	if p.CurrentState == Idle || p.CurrentState == Move || p.CurrentState == Charging {
 		if p.Input.IsCharging {
 			p.CurrentState = Charging
-			p.ChargeTimer += delta
+			chargeRate := 1.0
+			if p.SpeedsterBuffTimer > 0 {
+				chargeRate = 1.5 // 极速者大招期间蓄力速度提升 1.5 倍
+			}
+			p.ChargeTimer += delta * chargeRate
 			if p.ChargeTimer >= MaxChargeTime {
 				p.startDashFromCharge()
 			}
@@ -185,6 +206,8 @@ func (p *BattlePlayer) Update(delta float64) {
 	// 轨道 A1：受击与死亡（台球级顺滑刹车）
 	if p.CurrentState == HitStun || p.CurrentState == Dead {
 		p.Velocity = p.Velocity.Lerp(Vector2{}, HitStunFriction*delta)
+	} else if p.CurrentState == SkillCast {
+		p.Velocity = p.Velocity.Lerp(Vector2{}, DashFriction*delta)
 	} else if p.CurrentState == Dashing {
 		// 轨道 A2：冲刺（极速急停）；结束时机由 StateTimer 驱动，见 Dashing 分支
 		p.Velocity = p.Velocity.Lerp(Vector2{}, DashFriction*delta)
@@ -219,6 +242,7 @@ func (p *BattlePlayer) Update(delta float64) {
 	if dirToMouse.Length() > 0.001 {
 		p.RotY = math.Atan2(dirToMouse.Z, dirToMouse.X) * 180.0 / math.Pi
 	}
+
 }
 
 // startDashFromCharge 按蓄力时间转换冲刺初速度。
@@ -235,12 +259,24 @@ func (p *BattlePlayer) startDashFromCharge() {
 	p.CurrentState = Dashing
 	p.StateTimer = DashDuration
 	p.HasHit = false
-	dirToMouse := Vector2{X: p.Input.MouseX - p.Position.X, Z: p.Input.MouseY - p.Position.Z}.Normalized()
-	if dirToMouse.Length() == 0 {
-		dirToMouse = Vector2{X: 1, Z: 0}
+
+	// 【核心修复】：恢复 360 度鼠标瞄准冲刺
+	dirToMouse := Vector2{X: p.Input.MouseX - p.Position.X, Z: p.Input.MouseY - p.Position.Z}
+	dir := dirToMouse.Normalized()
+	if dir.Length() == 0 {
+		dir = Vector2{X: p.FacingX, Z: 0} // 兜底保护
 	}
 	initialBurstSpeed := distance * DashFriction
-	p.Velocity = p.Velocity.Add(dirToMouse.Mul(initialBurstSpeed))
+	p.Velocity = p.Velocity.Add(dir.Mul(initialBurstSpeed))
+
+	// 极速者大招期间停止积攒能量
+	if p.SpeedsterBuffTimer <= 0 {
+		energyGain := int32(effectiveTime * 2.0)
+		p.Energy += energyGain
+		if p.Energy > 15 {
+			p.Energy = 15
+		}
+	}
 }
 
 // ===== 新增代码 END =====

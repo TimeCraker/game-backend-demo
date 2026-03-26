@@ -1391,6 +1391,80 @@ feat(gateway): upgrade WebSocket hub for dual-protocol (JSON/Protobuf) routing
 
 ---
 
+--- WIKI PAGE: 📆-2026.03.25-开发笔记.md ---
+
+# 📆 2026.03.25 开发笔记：服务端权威架构与引擎重构
+
+## ✅ 三仓库 Commit Messages 及更新清单
+
+### 1. Go 微服务后端 (`game-backend-demo`)
+
+**Commit Message:**
+```plaintext
+feat(battle): implement 60Hz authoritative server and combat arbiter with thread-safe gateway
+```
+
+**中文解析**  
+- **物理引擎服务端化**：脱离第三方物理引擎，手写 2D 向量数学库（`math.go`），实现 60Hz 定点 Tick 循环，接管所有坐标积分与速度衰减运算。  
+- **战斗裁决矩阵**：基于扇形 Dot 乘积与距离检测，建立不对称博弈系统，实现“绝对拼刀”与“单方碾压”的独立数值结算（1600 击退初速度、0.4s/0.5s 差异化硬直）。  
+- **全量参数控制台**：提取所有魔法数字为全局常量（`BaseSpeed`、`DashFriction`、`HitStunFriction` 等），实现极简数据驱动调参。  
+- **网关高并发重构**：修复 Gorilla WebSocket 多协程并发写入导致的 Panic，封装带 `sync.Mutex` 的强类型 `Client` 结构，实现战斗高频广播与大厅心跳的线程安全。  
+- **优雅资源回收**：修复房间泄露 Bug，任意一方断线即触发 `BattleRoom.Stop()` 销毁物理计算协程。
+
+---
+
+### 2. Godot 核心战斗引擎 (`asternova-godot-client`)
+
+**Commit Message:**
+```plaintext
+feat(core): migrate to Godot 2D with client-side prediction and pure GDScript protobuf bridge
+```
+
+**中文解析**  
+- **引擎大迁徙**：废弃 Unity WebGL，全面转向更轻量的 Godot 2D 架构，大幅降低包体与加载耗时。  
+- **纯手搓双轨制物理**：实现基于 `MoveToward` 与指数 `Lerp` 的平滑加减速，引入反向输入 4 倍急停，以及鼠标点击蓄力距离映射系统。  
+- **无依赖 Protobuf 解析**：弃用第三方插件，纯手写底层字节流解析器（`ProtoParser.gd`），完美支持 Varint、Length-delimited 和 32-bit Wire Type 封包与解包。  
+- **硬核网络同步**：  
+  - **本地预测**：剥离物理碰撞件，采用纯数学距离检测；撞击瞬间立即修改本地状态与速度并开启 0.35s 预测锁，实现 0 延迟台球级手感。  
+  - **权威和解**：被动受击或不可控状态时无条件接受服务器快照覆写；平时消除小幅抖动，仅在误差 > 200.0 时触发防作弊硬拉回。  
+- **JSBridge 跨界打通**：通过 `JavaScriptBridge` 暴露 `window.enterBattle`，精准接收 React 侧下发的 Token 与 RoomID。
+
+---
+
+### 3. React Web 前端大厅 (`asternova-web-client`)
+
+**Commit Message:**
+```plaintext
+refactor(arena): adapt JSBridge for Godot Web export and prepare energy HUD sync
+```
+
+**中文解析**  
+- **容器迁移**：将原 `react-unity-webgl` 容器替换为 Godot HTML5 导出标准的 IFrame / Canvas 挂载方案。  
+- **事件总线升级**：重构 `window.parent.dispatchEvent` 监听器，适配 Godot 抛出的 `unity:battle_result` 自定义事件（保留原命名减少破坏性修改）。  
+- **UI 预渲染优化**：使用 Tailwind 构建轻盈通透的视觉体系，为即将到来的动态能量条和终极技能遮罩预留 CSS 接口。
+
+---
+
+## 🌌 核心变革总结（团队 Wiki 摘录）
+
+> **“神权降临——服务端权威架构与引擎重构”**
+
+### 引擎跃迁：Unity → Godot 2D
+- 果断抛弃过于沉重的 Unity WebGL，战斗核心重构为 **Godot 2D**。  
+- 包体与加载速度质变，标志性粉紫赛博渐变在 2D 渲染下更显纯粹。
+
+### 终结“手感灾难”：服务端权威 + 客户端预测与和解
+- **服务端**：60Hz 权威 Tick，纯数学碰撞矩阵，冷酷裁决。  
+- **客户端**：Godot 实现本地预测（Prediction Lock），按键瞬间响应 1600 速度击退；0.35s 后与服务端状态完美重合，消灭穿模与卡顿。  
+- **参数全量外置**：手感参数（起步 1.33s、阻尼 18.0、击退 1600、硬直 0.4s）全部抽离至 Go 服务端常量区，调参无需触碰客户端。
+
+### 架构绝对控制力
+- 后端网关彻底线程安全，房间资源回收无泄漏。  
+- Godot 端纯手写 Protobuf 解析器，零依赖完成二进制通信。  
+- React 前端无缝适配 Godot WebGL 容器，为能量条与终极技能预留接口。
+
+> **“Reach Beyond the Stars” —— 基建已扎到最硬岩层，正式向星空进发。**
+
 --- WIKI PAGE: 🗓️2026.02.25-学习笔记.md ---
 
 Welcome to the my-backend-demo wiki!

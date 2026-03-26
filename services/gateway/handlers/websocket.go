@@ -116,6 +116,26 @@ func HandleWS() gin.HandlerFunc {
 				break
 			}
 
+			// 拦截 Godot 发来的 JSON 文本格式大招指令
+			if len(message) > 0 && message[0] == '{' {
+				var jsonObj struct {
+					Type string `json:"type"`
+				}
+				if err := json.Unmarshal(message, &jsonObj); err == nil && jsonObj.Type == "cast_ultimate" {
+					if scope == "battle" {
+						if roomValue, ok := GlobalHub.ActiveBattles.Load(roomID); ok {
+							if br, castOK := roomValue.(*battle.BattleRoom); castOK {
+								select {
+								case br.UltCh <- uint32(userID):
+								default:
+								}
+							}
+						}
+					}
+					continue
+				}
+			}
+
 			// 统一解码层
 			var msg pb.GameMessage
 			if messageType == websocket.TextMessage {

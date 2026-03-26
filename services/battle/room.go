@@ -24,8 +24,13 @@ type BattleRoom struct {
 	Player1 BattlePlayer
 	Player2 BattlePlayer
 
+	// IsGameOver：战斗是否已进入结算，避免重复广播与重复停止房间
+	IsGameOver bool
+
 	// InputCh：输入通道，由网关将客户端输入投递到该通道
 	InputCh chan InputEvent
+	// UltCh：大招指令通道（JSON cast_ultimate）
+	UltCh chan uint32
 	// BroadcastCh：每帧下行快照通道，供网关消费并广播给前端
 	BroadcastCh chan []byte
 	// stopCh：用于优雅停止房间 tick 循环
@@ -53,6 +58,7 @@ func NewBattleRoom(roomID string, p1ID, p2ID uint32) *BattleRoom {
 			FacingX:      -1.0,
 		},
 		InputCh:     make(chan InputEvent, 128),
+		UltCh:       make(chan uint32, 10),
 		BroadcastCh: make(chan []byte, 128),
 		stopCh:      make(chan struct{}),
 	}
@@ -70,6 +76,8 @@ func (r *BattleRoom) Start() {
 			return
 		case ev := <-r.InputCh:
 			r.applyInput(ev)
+		case uid := <-r.UltCh:
+			r.applyUltimate(uid)
 		case now := <-ticker.C:
 			delta := now.Sub(last).Seconds()
 			last = now
@@ -97,6 +105,32 @@ func (r *BattleRoom) applyInput(ev InputEvent) {
 		r.Player1.Input = ev.Input
 	case r.Player2.UserID:
 		r.Player2.Input = ev.Input
+	}
+}
+
+func (r *BattleRoom) applyUltimate(uid uint32) {
+	var p *BattlePlayer
+	if r.Player1.UserID == uid {
+		p = &r.Player1
+	} else if r.Player2.UserID == uid {
+		p = &r.Player2
+	} else {
+		return
+	}
+
+	if p.Energy >= 15 && p.CurrentState != Dead && p.CurrentState != HitStun {
+		p.Energy = 0
+		p.ChargeTimer = 0
+
+		p.CurrentState = SkillCast
+		p.StateTimer = 0.1 // 全角色通用：0.1s 霸体前摇
+
+		switch p.ClassID {
+		case "Role1_Speedster": // 极速者：挂载 15 秒状态
+			p.SpeedsterBuffTimer = 15.0
+		case "Role3_Reviver":
+			// 预留复苏者逻辑
+		}
 	}
 }
 
@@ -165,7 +199,12 @@ func (r *BattleRoom) checkMeleeHit(attacker, victim *BattlePlayer) bool {
 	}
 
 	dirToVictim := dirToVictimRaw.Normalized()
-	facingDir := Vector2{X: attacker.FacingX, Z: 0}
+	// 【核心修复】：恢复 360 度鼠标瞄准的扇形攻击判定
+	dirToMouse := Vector2{X: attacker.Input.MouseX - attacker.Position.X, Z: attacker.Input.MouseY - attacker.Position.Z}
+	facingDir := dirToMouse.Normalized()
+	if facingDir.Length() == 0 {
+		facingDir = Vector2{X: attacker.FacingX, Z: 0}
+	}
 	return dirToVictim.Dot(facingDir) >= 0.5
 }
 
@@ -206,6 +245,26 @@ func (r *BattleRoom) applyClash(p1, p2 *BattlePlayer) {
 }
 
 func (r *BattleRoom) applyNormalHit(attacker, victim *BattlePlayer) {
+	// 【全角色通用底层机制】霸体判定：SkillCast 期间绝对不可被打断
+	if victim.CurrentState == SkillCast {
+		victim.HP -= BaseDamage
+		var bounceDir Vector2
+		if attacker.CurrentState == Dashing {
+			bounceDir = attacker.Velocity.Normalized().Mul(-1.0)
+		} else {
+			dirToMouse := Vector2{X: attacker.Input.MouseX - attacker.Position.X, Z: attacker.Input.MouseY - attacker.Position.Z}
+			bounceDir = dirToMouse.Normalized().Mul(-1.0)
+			if bounceDir.Length() == 0 {
+				bounceDir = Vector2{X: -attacker.FacingX, Z: 0}
+			}
+		}
+		attacker.CurrentState = HitStun
+		attacker.StateTimer = HitStunNormal
+		attacker.HasHit = true
+		attacker.Velocity = bounceDir.Mul(KnockbackSpeed)
+		return
+	}
+
 	attacker.Energy += EnergyReward
 	if attacker.Energy > 15 {
 		attacker.Energy = 15
@@ -225,7 +284,11 @@ func (r *BattleRoom) applyNormalHit(attacker, victim *BattlePlayer) {
 	if attacker.CurrentState == Dashing {
 		pushDir = attacker.Velocity.Normalized()
 	} else {
-		pushDir = Vector2{X: attacker.FacingX, Z: 0}
+		dirToMouse := Vector2{X: attacker.Input.MouseX - attacker.Position.X, Z: attacker.Input.MouseY - attacker.Position.Z}
+		pushDir = dirToMouse.Normalized()
+		if pushDir.Length() == 0 {
+			pushDir = Vector2{X: attacker.FacingX, Z: 0}
+		}
 	}
 	victim.Velocity = pushDir.Mul(KnockbackSpeed)
 }
@@ -237,6 +300,40 @@ func (r *BattleRoom) enforceDeath(p *BattlePlayer) {
 	p.HP = 0
 	p.CurrentState = Dead
 	p.StateTimer = 0
+
+	// ===== 新增代码 START =====
+	// 修改内容：在战斗首次进入死亡结算时，广播 game_over 并在 4 秒后安全停止物理协程
+	// 修改原因：触发客户端子弹时间演出并确保服务端内存安全销毁（避免重复 Stop）
+	// 影响范围：仅影响结算阶段的广播与房间停止时机，不改变击中/死亡状态本身
+	// 如果游戏还没结束，触发结算广播与延迟关停逻辑
+	if !r.IsGameOver {
+		r.IsGameOver = true
+
+		// 找出胜利者 ID
+		winnerID := r.Player1.UserID
+		if p.UserID == r.Player1.UserID {
+			winnerID = r.Player2.UserID
+		}
+
+		// 立即广播游戏结束，让客户端播慢动作特写
+		msg := &pb.GameMessage{
+			Type:   "game_over",
+			RoomId: r.RoomID,
+			UserId: winnerID,
+		}
+		payload, _ := proto.Marshal(msg)
+		select {
+		case r.BroadcastCh <- payload:
+		default:
+		}
+
+		// 开启 4 秒倒计时，4 秒后安全销毁物理引擎协程
+		go func() {
+			time.Sleep(4 * time.Second)
+			r.Stop()
+		}()
+	}
+	// ===== 新增代码 END =====
 }
 
 // emitStateSnapshot 将当前房间玩家状态组装为协议消息并投递到广播通道。

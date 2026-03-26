@@ -53,8 +53,6 @@ C:.
 |       
 +---services
 |   +---auth
-|   |   |   main.go
-|   |   |   
 |   |   +---db
 |   |   |       mysql.go
 |   |   |       redis.go
@@ -80,6 +78,11 @@ C:.
 |   |           email.go
 |   |           jwt.go
 |   |           
+|   +---battle
+|   |       math.go
+|   |       player_state.go
+|   |       room.go
+|   |       
 |   +---gateway
 |   |   \---handlers
 |   |           hub.go
@@ -89,7 +92,6 @@ C:.
 |   |       matcher.go
 |   |       
 |   \---proto
-|           Game.cs
 |           game.pb.go
 |           game.proto
 |           
