@@ -353,6 +353,69 @@ feat(ui): implement SPA-style auth flow with UI Toolkit
 - 构建 **游戏大厅 UI**（房间列表、玩家状态）。
 - 优化其他玩家移动的网络插值算法，消除轻微卡顿，提升同步平滑度。
 
+--- WIKI PAGE: #-📆-2026.03.26-开发笔记：组件化视觉重构与极致打击感实装.md ---
+
+# 📆 2026.03.26 开发笔记：组件化视觉重构与极致打击感实装
+
+## ✅ 本次 Commit 核心更新清单
+
+### 1. Godot 客户端 (`asternova-godot-client`)
+
+**Commit Message:**
+```plaintext
+feat(visual): implement component-based role visuals and hardcore hit-stop/shake mechanics
+```
+
+**中文解析**  
+- **视觉组件化架构**：将 `player.gd` 降级为纯物理与状态宿主，为“极速者 (Speedster)”与“复苏者 (Reviver)”建立独立的 `roles/` 视觉组件目录。  
+- **纯代码 Tween 动效系统**：废弃 AnimationPlayer，用纯代码实现待机呼吸、跑动拉伸、受击赛博闪红（`Color(3.0, 0.2, 0.2)`）等动效，解除对特定美术骨骼的强依赖。  
+- **极致打击感实装**：  
+  - **Hit-Stop (卡肉顿帧)**：普通命中触发 0.08s、绝对拼刀触发 0.15s 的 `0.05x` 时间定格。  
+  - **Screen Shake (屏幕震动)**：引入 `GroupCamera` 的 `apply_shake` 接口与随机向量偏移，拼刀时爆发最高 30.0 强度的剧烈震颤。  
+  - **Bullet Time (绝杀特写)**：拦截 `game_over` 信号，触发全引擎 `0.2x` 慢动作子弹时间，1 秒后回调 React 前端弹出全屏结算。  
+- **JSON + Proto 双轨解析**：在 `BattleWsClient.gd` 引入 JSON 侧信道探测，接收轻量级环境与情报广播（如 `room_info`），降低字段增改时的 Protobuf 编译成本。
+
+### 2. Go 微服务后端 (`game-backend-demo`)
+
+**Commit Message:**
+```plaintext
+feat(gateway): broadcast class info via JSON side channel during handshake
+```
+
+**中文解析**  
+- **双端情报握手**：在 WebSocket 战斗握手阶段，向房间内广播包含 `p1_class` 和 `p2_class` 的 JSON 侧信道消息，驱动客户端动态挂载对应的特效与动画组件。
+
+---
+
+## 🌌 核心变革与当前状态总结（团队 Wiki 摘录）
+
+> **“形神分离——组件化视觉基建与 360 度操作捍卫”**
+
+- **核心操作逻辑的捍卫与缝合**  
+  俯视角 360 度竞技核心：在短暂“纯 2D 街机视角”试错后，团队果断回退，坚决捍卫类似《哈迪斯》的 360 度鼠标全向瞄准、全向冲刺与扇形劈砍体验。  
+  2D 视觉对望降维：剥离服务端鼠标朝向同步，客户端实现“自动左右翻转对望”，既保留 2D 骨骼动画最佳观赏角度，又杜绝因鼠标旋转导致的美术贴图倒立 Bug。
+
+- **组件化跃迁**  
+  彻底消灭 `player.gd` 中的“面条代码”。宿主只负责网络平滑插值与物理数学，检测到职业后动态 `preload` 对应 `role.gd` 挂载至身下。  
+  解耦威力：极速者的粉紫渐变雷电拖尾与复苏者的翠绿生命光环互不干扰；即使网络延迟导致 `room_info` 后到达，客户端也会在 `update_network_state` 中持续重试挂载组件。
+
+- **刀刀到肉的 Game Feel**  
+  通过 `Engine.time_scale = 0.05` 制造的短暂系统级卡顿，完美模拟刀刃劈入骨肉的物理阻滞感，配合屏幕剧烈震颤，战斗手感已达商业动作游戏及格线。
+
+---
+
+## 🚀 未来的终极蓝图 (Future Roadmap)
+
+本地全链路基建已 100% 竣工，接下来两大冲刺目标：
+
+- **阶段 8：听觉反馈注入**  
+  建立全局 `AudioManager`，接入挥空声、砍肉声、拼刀打铁声和大招爆气声，将感官刺激推向极致。
+
+- **阶段 9：公网联机与部署**  
+  将 React 部署至 Vercel，将 Go 编译部署至 Linux 云服务器，打通公网 WebSocket，实现真正的双端跨电脑联机对战！
+
+---
+
 --- WIKI PAGE: 2026.03.04-开发笔记.md ---
 
 ---

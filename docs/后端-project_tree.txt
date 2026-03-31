@@ -3,6 +3,8 @@ Volume serial number is B85E-49CE
 C:.
 |   .cursorrules
 |   .gitignore
+|   asternova-server
+|   backend.zip
 |   docker-compose.yml
 |   game-backend-demo.exe
 |   go.mod
@@ -10,6 +12,7 @@ C:.
 |   main.go
 |   README.md
 |   
++---.cursor
 +---.roo
 |   \---rules
 |           backend_rules.md
@@ -35,6 +38,7 @@ C:.
 |       ??-2026.03.04-�����ʼǣ�Unity-�Խ��������޸�.md
 |       ??-2026.03.08-�����ʼ�.md
 |       ??-2026.03.17-�����ʼǣ��ܹ�ԾǨ����������ֿ���΢������������.md
+|       ??-2026.03.25-�����ʼ�.md
 |       ???2026.02.25-ѧϰ�ʼ�.md
 |       
 +---docs
@@ -59,8 +63,10 @@ C:.
 |   |   |       
 |   |   +---handlers
 |   |   |   +---account
+|   |   |   |       guest_login.go
 |   |   |   |       login.go
 |   |   |   |       register.go
+|   |   |   |       reset_password.go
 |   |   |   |       user.go
 |   |   |   |       
 |   |   |   \---send_email

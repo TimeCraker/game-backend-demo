@@ -30,7 +30,7 @@ func SendEmailCode(c *gin.Context) {
 	// Redis Key 定义
 	cooldownKey := "email_cooldown:" + email
 	dailyLimitKey := fmt.Sprintf("email_daily_limit:%s:%s", email, today)
-	codeKey := "register_code:" + email
+	codeKey := "auth_code:" + email
 
 	// ===== 核心逻辑：Redis 限流检查 START =====
 	// 1. 60秒冷却检查

@@ -69,7 +69,10 @@ func main() {
 	{
 		api.POST("/register", account.Register)
 		api.POST("/login", account.Login)
+		api.POST("/login-with-email", account.LoginWithEmail)
+		api.POST("/guest-login", account.GuestLogin)
 		api.POST("/send-code", send_email.SendEmailCode)
+		api.POST("/reset-password", account.ResetPasswordWithEmail)
 
 		authz := api.Group("")
 		authz.Use(middleware.AuthMiddleware())
@@ -87,6 +90,9 @@ func main() {
 		v1.POST("/send_code", send_email.SendEmailCode)
 		v1.POST("/register", account.Register)
 		v1.POST("/login", account.Login)
+		v1.POST("/login_with_email", account.LoginWithEmail)
+		v1.POST("/guest_login", account.GuestLogin)
+		v1.POST("/reset_password", account.ResetPasswordWithEmail)
 
 		// 需要鉴权的路由示例：/api/v1/profile（返回结构与 /api/me 不同，保留兼容）
 		v1.GET("/profile", middleware.AuthMiddleware(), func(c *gin.Context) {

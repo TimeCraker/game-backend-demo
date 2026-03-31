@@ -4,43 +4,43 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"time" // 修复报错：引入 time 包
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 
 	"github.com/TimeCraker/game-backend-demo/services/auth/db"
 	"github.com/TimeCraker/game-backend-demo/services/auth/models"
 	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
 )
 
-// Login 处理用户登录逻辑
-// 【改动点】去掉了 mysqlDB 参数，现在它直接就是一个标准的 gin Handler
+type loginRequest struct {
+	Identifier string `json:"identifier" binding:"required"`
+	Password   string `json:"password" binding:"required"`
+}
+
+type loginWithEmailRequest struct {
+	Email string `json:"email" binding:"required,email"`
+	Code  string `json:"code" binding:"required,len=6"`
+}
+
+// Login 处理账号密码登录（用户名或邮箱）
 func Login(c *gin.Context) {
-	// 1. 获取登录参数
-	var input struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
+	var input loginRequest
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
 		return
 	}
 
-	// ===== 新增代码 START =====
-	// 登录防爆破：基于 Redis 的失败次数计数与封禁
 	clientIP := c.ClientIP()
-	identifier := input.Username
+	identifier := input.Identifier
 	if identifier == "" {
 		identifier = clientIP
 	}
 	failKey := fmt.Sprintf("login_fail_count:%s", identifier)
 
-	// 先检查当前是否已被封禁
-	// 修复报错：将声明但未使用的 countStr 改为 _
 	if _, err := db.RDB.Get(db.Ctx, failKey).Result(); err == nil {
-		// 已存在计数时进行阈值判断
-		// 不严格区分解析错误，失败时默认跳过，避免因为 Redis 问题影响正常登录
 		var current int64
 		if n, parseErr := db.RDB.Get(db.Ctx, failKey).Int64(); parseErr == nil {
 			current = n
@@ -57,45 +57,28 @@ func Login(c *gin.Context) {
 			return
 		}
 	}
-	// ===== 新增代码 END =====
 
-	// 2. 查数据库找用户
 	var user models.User
-	// 【改动点】使用全局变量 DB 替代 mysqlDB
-
-	// 替换失效的 DB 为 db.SQLDB
-	if err := db.SQLDB.Where("username = ?", input.Username).First(&user).Error; err != nil {
-		// ===== 新增代码 START =====
-		// 用户名不存在也视为一次失败尝试，增加计数
+	if err := db.SQLDB.Where("username = ? OR email = ?", input.Identifier, input.Identifier).First(&user).Error; err != nil {
 		_ = db.RDB.Incr(db.Ctx, failKey).Err()
-		// 对新创建的计数设置基础过期时间，避免长期占用
 		_ = db.RDB.Expire(db.Ctx, failKey, 5*time.Minute).Err()
-		// ===== 新增代码 END =====
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
 	}
 
-	// 3. 验证密码 (Bcrypt 发挥作用的地方)
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)); err != nil {
-		// ===== 新增代码 START =====
-		// 密码错误，同样累加失败计数并设置过期
 		_ = db.RDB.Incr(db.Ctx, failKey).Err()
 		_ = db.RDB.Expire(db.Ctx, failKey, 5*time.Minute).Err()
-		// ===== 新增代码 END =====
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
 	}
 
-	// 4. 生成 JWT Token (颁发 VIP 胸牌)
-	// 🟢 这里会自动调用上面定义的 72 小时逻辑
 	token, err := utils.GenerateToken(int(user.ID))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token生成失败"})
 		return
 	}
 
-	// ================== 【核心：Redis 操作】 ==================
-	// 5. 将用户标记为在线
 	err = db.SetUserOnline(user.ID)
 	if err != nil {
 		log.Printf("⚠️ 警告：无法将用户 %d 标记为在线: %v", user.ID, err)
@@ -103,15 +86,62 @@ func Login(c *gin.Context) {
 		log.Printf("👤 玩家 ID:%d 已上线，在线状态已存入 Redis", user.ID)
 	}
 
-	// ===== 新增代码 START =====
-	// 登录成功后清空失败计数，防止历史失败影响后续正常登录
 	_ = db.RDB.Del(db.Ctx, failKey).Err()
-	// ===== 新增代码 END =====
-	// ============================================================
 
-	// 6. 返回结果
 	c.JSON(http.StatusOK, gin.H{
 		"message": "登录成功",
 		"token":   token,
+		"user": gin.H{
+			"id":       user.ID,
+			"username": user.Username,
+			"email":    user.Email,
+		},
+	})
+}
+
+// LoginWithEmail 处理邮箱验证码登录（已注册直接登录，未注册返回 require_setup）
+func LoginWithEmail(c *gin.Context) {
+	var input loginWithEmailRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
+		return
+	}
+
+	codeKey := "auth_code:" + input.Email
+	expectedCode, err := db.RDB.Get(db.Ctx, codeKey).Result()
+	if err != nil || expectedCode != input.Code {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "验证码错误或已过期"})
+		return
+	}
+
+	var user models.User
+	if err := db.SQLDB.Where("email = ?", input.Email).First(&user).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusAccepted, gin.H{
+				"action":  "require_setup",
+				"message": "邮箱验证成功，请设置用户名和密码",
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器内部错误"})
+		return
+	}
+
+	_ = db.RDB.Del(db.Ctx, codeKey).Err()
+	token, err := utils.GenerateToken(int(user.ID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token生成失败"})
+		return
+	}
+
+	_ = db.SetUserOnline(user.ID)
+	c.JSON(http.StatusOK, gin.H{
+		"message": "登录成功",
+		"token":   token,
+		"user": gin.H{
+			"id":       user.ID,
+			"username": user.Username,
+			"email":    user.Email,
+		},
 	})
 }

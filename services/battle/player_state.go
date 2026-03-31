@@ -12,7 +12,7 @@ const (
 	ChargeSpeedMultiplier  = 0.3
 	MaxChargeTime          = 3.5
 	MaxEffectiveChargeTime = 2.5
-	AccelTime              = 1.33
+	AccelTime              = 0.30
 	DashFriction           = 18.0
 	HitStunFriction        = 8.0
 	DashDistMultiplier     = 1.5
@@ -212,6 +212,7 @@ func (p *BattlePlayer) Update(delta float64) {
 		// 轨道 A2：冲刺（极速急停）；结束时机由 StateTimer 驱动，见 Dashing 分支
 		p.Velocity = p.Velocity.Lerp(Vector2{}, DashFriction*delta)
 	} else {
+		// 轨道 B：常规移动 (起步快 1.5 倍)
 		currentMaxSpeed := BaseSpeed
 		if p.CurrentState == Charging {
 			currentMaxSpeed = BaseSpeed * ChargeSpeedMultiplier

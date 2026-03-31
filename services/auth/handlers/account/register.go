@@ -5,6 +5,7 @@ import (
 
 	"github.com/TimeCraker/game-backend-demo/services/auth/db"
 	"github.com/TimeCraker/game-backend-demo/services/auth/models"
+	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -28,14 +29,13 @@ func Register(c *gin.Context) {
 		return
 	}
 
-	// 1.5 从 Redis 校验验证码 (使用 db.RDB 和 db.Ctx)
-	expectedCode, err := db.RDB.Get(db.Ctx, "register_code:"+req.Email).Result()
+	// 1.5 从 Redis 校验验证码 (统一使用 auth_code)
+	codeKey := "auth_code:" + req.Email
+	expectedCode, err := db.RDB.Get(db.Ctx, codeKey).Result()
 	if err != nil || expectedCode != req.Code {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "验证码错误或已过期"})
 		return
 	}
-	// 验证成功后立即删除，防止单码多次注册
-	db.RDB.Del(db.Ctx, "register_code:"+req.Email)
 
 	// 2. 检查用户名是否已存在
 	var existingUser models.User
@@ -71,8 +71,21 @@ func Register(c *gin.Context) {
 		return
 	}
 
+	// 创建成功后删除验证码，并直接签发 token（注册即登录）
+	_ = db.RDB.Del(db.Ctx, codeKey).Err()
+	token, err := utils.GenerateToken(int(user.ID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token生成失败"})
+		return
+	}
+
 	c.JSON(http.StatusCreated, gin.H{
-		"id":      user.ID,
-		"message": "恭喜！玩家账号创建成功",
+		"message": "注册并登录成功",
+		"token":   token,
+		"user": gin.H{
+			"id":       user.ID,
+			"username": user.Username,
+			"email":    user.Email,
+		},
 	})
 }

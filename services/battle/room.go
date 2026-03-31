@@ -1,6 +1,7 @@
 package battle
 
 import (
+	"encoding/json"
 	"time"
 
 	pb "github.com/TimeCraker/game-backend-demo/services/proto"
@@ -43,6 +44,7 @@ func NewBattleRoom(roomID string, p1ID, p2ID uint32) *BattleRoom {
 		RoomID: roomID,
 		Player1: BattlePlayer{
 			UserID:       p1ID,
+			ClassID:      "Role1_Speedster",
 			CurrentState: Idle,
 			Position:     Vector2{X: -300, Z: 0},
 			HP:           100,
@@ -51,6 +53,7 @@ func NewBattleRoom(roomID string, p1ID, p2ID uint32) *BattleRoom {
 		},
 		Player2: BattlePlayer{
 			UserID:       p2ID,
+			ClassID:      "Role1_Speedster",
 			CurrentState: Idle,
 			Position:     Vector2{X: 300, Z: 0},
 			HP:           100,
@@ -375,6 +378,19 @@ func (r *BattleRoom) emitStateSnapshot() {
 	case r.BroadcastCh <- payload:
 	default:
 	}
+}
+
+// GenerateRoomInfo 组装双端职业情报
+func (r *BattleRoom) GenerateRoomInfo() []byte {
+	infoMsg := map[string]interface{}{
+		"type":     "room_info",
+		"p1_id":    r.Player1.UserID,
+		"p1_class": r.Player1.ClassID,
+		"p2_id":    r.Player2.UserID,
+		"p2_class": r.Player2.ClassID,
+	}
+	data, _ := json.Marshal(infoMsg)
+	return data
 }
 
 // ===== 新增代码 END =====

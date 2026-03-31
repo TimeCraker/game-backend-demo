@@ -81,6 +81,13 @@ func HandleWS() gin.HandlerFunc {
 				return
 			}
 			GlobalHub.JoinRoom(client, roomID)
+			// 玩家真正连上战斗 WS 时，向 room 索要情报并立刻单独下发
+			if roomValue, ok := GlobalHub.ActiveBattles.Load(roomID); ok {
+				if br, castOK := roomValue.(*battle.BattleRoom); castOK {
+					infoData := br.GenerateRoomInfo()
+					_ = client.WriteMessage(websocket.TextMessage, infoData)
+				}
+			}
 			log.Printf("🏠 玩家 %d 已加入战斗房间 roomId=%s", userID, roomID)
 		}
 

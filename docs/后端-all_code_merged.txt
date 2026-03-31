@@ -72,7 +72,10 @@ func main() {
 	{
 		api.POST("/register", account.Register)
 		api.POST("/login", account.Login)
+		api.POST("/login-with-email", account.LoginWithEmail)
+		api.POST("/guest-login", account.GuestLogin)
 		api.POST("/send-code", send_email.SendEmailCode)
+		api.POST("/reset-password", account.ResetPasswordWithEmail)
 
 		authz := api.Group("")
 		authz.Use(middleware.AuthMiddleware())
@@ -90,6 +93,9 @@ func main() {
 		v1.POST("/send_code", send_email.SendEmailCode)
 		v1.POST("/register", account.Register)
 		v1.POST("/login", account.Login)
+		v1.POST("/login_with_email", account.LoginWithEmail)
+		v1.POST("/guest_login", account.GuestLogin)
+		v1.POST("/reset_password", account.ResetPasswordWithEmail)
 
 		// 需要鉴权的路由示例：/api/v1/profile（返回结构与 /api/me 不同，保留兼容）
 		v1.GET("/profile", middleware.AuthMiddleware(), func(c *gin.Context) {
@@ -188,6 +194,110 @@ func SetUserOnline(userID uint) error {
 	return RDB.Set(Ctx, key, "1", 24*time.Hour).Err()
 }
 
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\handlers\account\guest_login.go ---
+
+package account
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/TimeCraker/game-backend-demo/services/auth/db"
+	"github.com/TimeCraker/game-backend-demo/services/auth/models"
+	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
+	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
+)
+
+const guestInviteCode = "77"
+
+type guestLoginRequest struct {
+	InviteCode string `json:"inviteCode" binding:"required"`
+}
+
+func randomHex(nBytes int) string {
+	b := make([]byte, nBytes)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
+}
+
+func randomGuestIdentity() (username string, email string) {
+	suffix := strings.ToUpper(randomHex(3))
+	if suffix == "" {
+		suffix = strings.ToUpper(time.Now().Format("150405"))
+	}
+	username = "Guest_" + suffix
+	email = strings.ToLower("guest_" + suffix + "@guest.asternova.local")
+	return
+}
+
+// GuestLogin 邀请码游客登录：输入固定邀请码后自动分配随机访客身份并进入大厅
+func GuestLogin(c *gin.Context) {
+	var req guestLoginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
+		return
+	}
+	if strings.TrimSpace(req.InviteCode) != guestInviteCode {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "邀请码无效"})
+		return
+	}
+
+	passwordSeed := randomHex(12)
+	if passwordSeed == "" {
+		passwordSeed = "guest_fallback_" + time.Now().Format("20060102150405")
+	}
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(passwordSeed), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器内部错误"})
+		return
+	}
+
+	var created models.User
+	createdOK := false
+	for i := 0; i < 6; i++ {
+		username, email := randomGuestIdentity()
+		user := models.User{
+			Username: username,
+			Email:    email,
+			Password: string(hashedPassword),
+		}
+		if err := db.SQLDB.Create(&user).Error; err == nil {
+			created = user
+			createdOK = true
+			break
+		}
+	}
+	if !createdOK {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "游客身份分配失败，请重试"})
+		return
+	}
+
+	token, err := utils.GenerateToken(int(created.ID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token生成失败"})
+		return
+	}
+
+	_ = db.SetUserOnline(created.ID)
+	c.JSON(http.StatusOK, gin.H{
+		"message": "游客登录成功",
+		"token":   token,
+		"user": gin.H{
+			"id":       created.ID,
+			"username": created.Username,
+			"email":    created.Email,
+			"is_guest": true,
+		},
+	})
+}
+
+
 --- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\handlers\account\login.go ---
 
 package account
@@ -196,43 +306,43 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"time" // 修复报错：引入 time 包
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 
 	"github.com/TimeCraker/game-backend-demo/services/auth/db"
 	"github.com/TimeCraker/game-backend-demo/services/auth/models"
 	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
 )
 
-// Login 处理用户登录逻辑
-// 【改动点】去掉了 mysqlDB 参数，现在它直接就是一个标准的 gin Handler
+type loginRequest struct {
+	Identifier string `json:"identifier" binding:"required"`
+	Password   string `json:"password" binding:"required"`
+}
+
+type loginWithEmailRequest struct {
+	Email string `json:"email" binding:"required,email"`
+	Code  string `json:"code" binding:"required,len=6"`
+}
+
+// Login 处理账号密码登录（用户名或邮箱）
 func Login(c *gin.Context) {
-	// 1. 获取登录参数
-	var input struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
+	var input loginRequest
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
 		return
 	}
 
-	// ===== 新增代码 START =====
-	// 登录防爆破：基于 Redis 的失败次数计数与封禁
 	clientIP := c.ClientIP()
-	identifier := input.Username
+	identifier := input.Identifier
 	if identifier == "" {
 		identifier = clientIP
 	}
 	failKey := fmt.Sprintf("login_fail_count:%s", identifier)
 
-	// 先检查当前是否已被封禁
-	// 修复报错：将声明但未使用的 countStr 改为 _
 	if _, err := db.RDB.Get(db.Ctx, failKey).Result(); err == nil {
-		// 已存在计数时进行阈值判断
-		// 不严格区分解析错误，失败时默认跳过，避免因为 Redis 问题影响正常登录
 		var current int64
 		if n, parseErr := db.RDB.Get(db.Ctx, failKey).Int64(); parseErr == nil {
 			current = n
@@ -249,45 +359,28 @@ func Login(c *gin.Context) {
 			return
 		}
 	}
-	// ===== 新增代码 END =====
 
-	// 2. 查数据库找用户
 	var user models.User
-	// 【改动点】使用全局变量 DB 替代 mysqlDB
-
-	// 替换失效的 DB 为 db.SQLDB
-	if err := db.SQLDB.Where("username = ?", input.Username).First(&user).Error; err != nil {
-		// ===== 新增代码 START =====
-		// 用户名不存在也视为一次失败尝试，增加计数
+	if err := db.SQLDB.Where("username = ? OR email = ?", input.Identifier, input.Identifier).First(&user).Error; err != nil {
 		_ = db.RDB.Incr(db.Ctx, failKey).Err()
-		// 对新创建的计数设置基础过期时间，避免长期占用
 		_ = db.RDB.Expire(db.Ctx, failKey, 5*time.Minute).Err()
-		// ===== 新增代码 END =====
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
 	}
 
-	// 3. 验证密码 (Bcrypt 发挥作用的地方)
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)); err != nil {
-		// ===== 新增代码 START =====
-		// 密码错误，同样累加失败计数并设置过期
 		_ = db.RDB.Incr(db.Ctx, failKey).Err()
 		_ = db.RDB.Expire(db.Ctx, failKey, 5*time.Minute).Err()
-		// ===== 新增代码 END =====
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
 	}
 
-	// 4. 生成 JWT Token (颁发 VIP 胸牌)
-	// 🟢 这里会自动调用上面定义的 72 小时逻辑
 	token, err := utils.GenerateToken(int(user.ID))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token生成失败"})
 		return
 	}
 
-	// ================== 【核心：Redis 操作】 ==================
-	// 5. 将用户标记为在线
 	err = db.SetUserOnline(user.ID)
 	if err != nil {
 		log.Printf("⚠️ 警告：无法将用户 %d 标记为在线: %v", user.ID, err)
@@ -295,16 +388,63 @@ func Login(c *gin.Context) {
 		log.Printf("👤 玩家 ID:%d 已上线，在线状态已存入 Redis", user.ID)
 	}
 
-	// ===== 新增代码 START =====
-	// 登录成功后清空失败计数，防止历史失败影响后续正常登录
 	_ = db.RDB.Del(db.Ctx, failKey).Err()
-	// ===== 新增代码 END =====
-	// ============================================================
 
-	// 6. 返回结果
 	c.JSON(http.StatusOK, gin.H{
 		"message": "登录成功",
 		"token":   token,
+		"user": gin.H{
+			"id":       user.ID,
+			"username": user.Username,
+			"email":    user.Email,
+		},
+	})
+}
+
+// LoginWithEmail 处理邮箱验证码登录（已注册直接登录，未注册返回 require_setup）
+func LoginWithEmail(c *gin.Context) {
+	var input loginWithEmailRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
+		return
+	}
+
+	codeKey := "auth_code:" + input.Email
+	expectedCode, err := db.RDB.Get(db.Ctx, codeKey).Result()
+	if err != nil || expectedCode != input.Code {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "验证码错误或已过期"})
+		return
+	}
+
+	var user models.User
+	if err := db.SQLDB.Where("email = ?", input.Email).First(&user).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusAccepted, gin.H{
+				"action":  "require_setup",
+				"message": "邮箱验证成功，请设置用户名和密码",
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器内部错误"})
+		return
+	}
+
+	_ = db.RDB.Del(db.Ctx, codeKey).Err()
+	token, err := utils.GenerateToken(int(user.ID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token生成失败"})
+		return
+	}
+
+	_ = db.SetUserOnline(user.ID)
+	c.JSON(http.StatusOK, gin.H{
+		"message": "登录成功",
+		"token":   token,
+		"user": gin.H{
+			"id":       user.ID,
+			"username": user.Username,
+			"email":    user.Email,
+		},
 	})
 }
 
@@ -317,6 +457,7 @@ import (
 
 	"github.com/TimeCraker/game-backend-demo/services/auth/db"
 	"github.com/TimeCraker/game-backend-demo/services/auth/models"
+	"github.com/TimeCraker/game-backend-demo/services/auth/utils"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -340,14 +481,13 @@ func Register(c *gin.Context) {
 		return
 	}
 
-	// 1.5 从 Redis 校验验证码 (使用 db.RDB 和 db.Ctx)
-	expectedCode, err := db.RDB.Get(db.Ctx, "register_code:"+req.Email).Result()
+	// 1.5 从 Redis 校验验证码 (统一使用 auth_code)
+	codeKey := "auth_code:" + req.Email
+	expectedCode, err := db.RDB.Get(db.Ctx, codeKey).Result()
 	if err != nil || expectedCode != req.Code {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "验证码错误或已过期"})
 		return
 	}
-	// 验证成功后立即删除，防止单码多次注册
-	db.RDB.Del(db.Ctx, "register_code:"+req.Email)
 
 	// 2. 检查用户名是否已存在
 	var existingUser models.User
@@ -383,11 +523,121 @@ func Register(c *gin.Context) {
 		return
 	}
 
+	// 创建成功后删除验证码，并直接签发 token（注册即登录）
+	_ = db.RDB.Del(db.Ctx, codeKey).Err()
+	token, err := utils.GenerateToken(int(user.ID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token生成失败"})
+		return
+	}
+
 	c.JSON(http.StatusCreated, gin.H{
-		"id":      user.ID,
-		"message": "恭喜！玩家账号创建成功",
+		"message": "注册并登录成功",
+		"token":   token,
+		"user": gin.H{
+			"id":       user.ID,
+			"username": user.Username,
+			"email":    user.Email,
+		},
 	})
 }
+
+--- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\handlers\account\reset_password.go ---
+
+package account
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/TimeCraker/game-backend-demo/services/auth/db"
+	"github.com/TimeCraker/game-backend-demo/services/auth/models"
+	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
+)
+
+type resetPasswordRequest struct {
+	Email           string `json:"email" binding:"required,email"`
+	Code            string `json:"code" binding:"required,len=6"`
+	NewPassword     string `json:"newPassword" binding:"required"`
+	ConfirmPassword string `json:"confirmPassword" binding:"required"`
+}
+
+func isValidPassword(p string) bool {
+	if len(p) < 6 || len(p) > 20 {
+		return false
+	}
+	hasLetter := false
+	hasDigit := false
+	for _, ch := range p {
+		if ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' {
+			hasLetter = true
+			continue
+		}
+		if ch >= '0' && ch <= '9' {
+			hasDigit = true
+			continue
+		}
+		// 仅允许字母和数字
+		return false
+	}
+	return hasLetter && hasDigit
+}
+
+// ResetPasswordWithEmail 邮箱验证码重置密码
+func ResetPasswordWithEmail(c *gin.Context) {
+	var req resetPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
+		return
+	}
+
+	if req.NewPassword != req.ConfirmPassword {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "两次密码输入不一致"})
+		return
+	}
+	if !isValidPassword(strings.TrimSpace(req.NewPassword)) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "密码需为 6-20 位字母+数字组合"})
+		return
+	}
+
+	codeKey := "auth_code:" + req.Email
+	expectedCode, err := db.RDB.Get(db.Ctx, codeKey).Result()
+	if err != nil || expectedCode != req.Code {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "验证码错误或已过期"})
+		return
+	}
+
+	var user models.User
+	if err := db.SQLDB.Where("email = ?", req.Email).First(&user).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "该邮箱未注册"})
+		return
+	}
+
+	hashed, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器内部错误"})
+		return
+	}
+
+	if err := db.SQLDB.Model(&user).Update("password", string(hashed)).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "密码更新失败"})
+		return
+	}
+
+	_ = db.RDB.Del(db.Ctx, codeKey).Err()
+
+	identifier := user.Username
+	if identifier == "" {
+		identifier = user.Email
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":    "密码重置成功，请重新登录",
+		"identifier": identifier,
+	})
+}
+
 
 --- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\auth\handlers\account\user.go ---
 
@@ -463,7 +713,7 @@ func SendEmailCode(c *gin.Context) {
 	// Redis Key 定义
 	cooldownKey := "email_cooldown:" + email
 	dailyLimitKey := fmt.Sprintf("email_daily_limit:%s:%s", email, today)
-	codeKey := "register_code:" + email
+	codeKey := "auth_code:" + email
 
 	// ===== 核心逻辑：Redis 限流检查 START =====
 	// 1. 60秒冷却检查
@@ -847,7 +1097,7 @@ const (
 	ChargeSpeedMultiplier  = 0.3
 	MaxChargeTime          = 3.5
 	MaxEffectiveChargeTime = 2.5
-	AccelTime              = 1.33
+	AccelTime              = 0.30
 	DashFriction           = 18.0
 	HitStunFriction        = 8.0
 	DashDistMultiplier     = 1.5
@@ -1047,6 +1297,7 @@ func (p *BattlePlayer) Update(delta float64) {
 		// 轨道 A2：冲刺（极速急停）；结束时机由 StateTimer 驱动，见 Dashing 分支
 		p.Velocity = p.Velocity.Lerp(Vector2{}, DashFriction*delta)
 	} else {
+		// 轨道 B：常规移动 (起步快 1.5 倍)
 		currentMaxSpeed := BaseSpeed
 		if p.CurrentState == Charging {
 			currentMaxSpeed = BaseSpeed * ChargeSpeedMultiplier
@@ -1121,6 +1372,7 @@ func (p *BattlePlayer) startDashFromCharge() {
 package battle
 
 import (
+	"encoding/json"
 	"time"
 
 	pb "github.com/TimeCraker/game-backend-demo/services/proto"
@@ -1163,6 +1415,7 @@ func NewBattleRoom(roomID string, p1ID, p2ID uint32) *BattleRoom {
 		RoomID: roomID,
 		Player1: BattlePlayer{
 			UserID:       p1ID,
+			ClassID:      "Role1_Speedster",
 			CurrentState: Idle,
 			Position:     Vector2{X: -300, Z: 0},
 			HP:           100,
@@ -1171,6 +1424,7 @@ func NewBattleRoom(roomID string, p1ID, p2ID uint32) *BattleRoom {
 		},
 		Player2: BattlePlayer{
 			UserID:       p2ID,
+			ClassID:      "Role1_Speedster",
 			CurrentState: Idle,
 			Position:     Vector2{X: 300, Z: 0},
 			HP:           100,
@@ -1497,6 +1751,19 @@ func (r *BattleRoom) emitStateSnapshot() {
 	}
 }
 
+// GenerateRoomInfo 组装双端职业情报
+func (r *BattleRoom) GenerateRoomInfo() []byte {
+	infoMsg := map[string]interface{}{
+		"type":     "room_info",
+		"p1_id":    r.Player1.UserID,
+		"p1_class": r.Player1.ClassID,
+		"p2_id":    r.Player2.UserID,
+		"p2_class": r.Player2.ClassID,
+	}
+	data, _ := json.Marshal(infoMsg)
+	return data
+}
+
 // ===== 新增代码 END =====
 
 --- FILE: C:\Users\TimeCraker\Desktop\game-backend-demo\services\gateway\handlers\hub.go ---
@@ -1799,6 +2066,13 @@ func HandleWS() gin.HandlerFunc {
 				return
 			}
 			GlobalHub.JoinRoom(client, roomID)
+			// 玩家真正连上战斗 WS 时，向 room 索要情报并立刻单独下发
+			if roomValue, ok := GlobalHub.ActiveBattles.Load(roomID); ok {
+				if br, castOK := roomValue.(*battle.BattleRoom); castOK {
+					infoData := br.GenerateRoomInfo()
+					_ = client.WriteMessage(websocket.TextMessage, infoData)
+				}
+			}
 			log.Printf("🏠 玩家 %d 已加入战斗房间 roomId=%s", userID, roomID)
 		}
 
