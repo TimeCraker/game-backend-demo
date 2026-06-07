@@ -18,7 +18,7 @@ var Ctx = context.Background()
 func InitRedis() {
 	// 初始化 Redis 客户端
 	RDB = redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379", // 对应 docker-compose 里的映射端口
+		Addr:     "localhost:6380", // 阿里云 Docker Redis 映射到 6380
 		Password: "",               // 默认没设密码
 		DB:       0,                // 使用 0 号数据库
 	})

@@ -2,6 +2,7 @@ package db
 
 import (
 	"log"
+	"os"
 
 	"github.com/TimeCraker/game-backend-demo/services/auth/models"
 	"gorm.io/driver/mysql"
@@ -12,8 +13,11 @@ import (
 var SQLDB *gorm.DB
 
 func InitMySQL() {
-	// 这里的 game_dev 是你的数据库名，rootpassword 是你的密码
-	dsn := "root:rootpassword@tcp(localhost:3306)/game_dev?charset=utf8mb4&parseTime=True&loc=Local"
+	// 优先从环境变量 DATABASE_DSN 读取，否则用本地默认值
+	dsn := os.Getenv("DATABASE_DSN")
+	if dsn == "" {
+		dsn = "root:rootpassword@tcp(localhost:3306)/game_dev?charset=utf8mb4&parseTime=True&loc=Local"
+	}
 
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {

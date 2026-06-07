@@ -29,4 +29,5 @@ coverage.*
 
 # --- 操作系统生成的垃圾文件 ---
 # 忽略 Windows 文件夹图标缓存
-Thumbs.db
+Thumbs.dbasternova-server-linux
+asternova-server
